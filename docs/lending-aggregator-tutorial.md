@@ -1,106 +1,82 @@
 # 从 0 到 1 搭建可扩展的 DeFi Lending Aggregator
 
-> 目标：Compound + MakerDAO 优先接入，后续支持 Aave / Spark / Morpho，可动态扩展 Adapter，具备自动迁移与闪电贷路径优化能力。
+> 目标：优先完成 Compound 与 MakerDAO 接入，后续拓展 Aave / Spark / Morpho。聚合器需支持仓位存取、借贷、跨协议迁移与闪电贷路由，链下服务负责策略调度与风控。
 >
-> 相关文档：`docs/contract-interface-reference.md`（接口参考指南）、`docs/project-structure.md`（目录结构建议）。
-
-}
-```
-
-> 其他协议（如 Aave、Spark、Morpho）可基于 `BaseAdapter` 独立实现各自的存取逻辑与附属接口。
-
-````
-- **目录约定**：仓库根目录 `<project-root>/AiFi`
-
-```bash
-cd <project-root>/AiFi
-git init
-git checkout -b main
-```
+> 推荐配套文档：`docs/contract-interface-reference.md`（接口详细说明）、`docs/project-structure.md`（目录结构建议）。
 
 ---
 
-## 2. 系统概览
+## 0. 教程导航
 
-- **智能合约层**：Aggregator 合约持有用户资金，Adapter 模式接入具体协议（Compound、Maker）。
-- **Foundry**：
-  - `src/`：Solidity 合约
-  - `test/`：单元测试
-  - `script/`：部署脚本
-- **Go 后端**：Module 架构
-  - `cmd/api`：HTTP API（deposit、withdraw、status）
-  - `cmd/worker`：消费迁移任务
-  - `internal/service`：业务逻辑（rateFetcher、strategy、taskBuilder）
-  - `pkg/adapter/client`：与链交互的统一接口
-- **缓存与消息队列**：
-  - Redis 存储最新利率、阈值
-  - RabbitMQ 处理迁移任务队列
-- **Postgres**：记录用户、仓位、迁移任务、利率历史
-- **流程**：
-  1. 用户通过 API `deposit` 请求
-  2. API 写入 Postgres（user、position），触发策略
-  3. rateFetcher 周期性抓取链上利率，更新 Redis + Postgres
-  4. Strategy 对比利率，若满足阈值，向 RabbitMQ 推送 `migration_task`
- 5. Worker 消费任务，执行 Solidity Aggregator 的迁移：优先使用闪电贷，若目标协议不支持则回退为分步操作
+- **适用读者**：准备从零搭建聚合器的链上/后端工程师，或需要对齐团队协作流程的 Tech Lead。
+- **阅读建议**：先通读第 0~2 章形成全局认识，再根据当前阶段跳转到对应里程碑。若只关注接口，可直接查阅 `docs/contract-interface-reference.md`。
+- **章节速查**：
+  - 第 0 章——先决条件、核心资源索引。
+  - 第 1 章——环境准备与仓库结构。
+  - 第 2 章——合约/后端接口速览与参考实现。
+  - 第 3 章及以后——按里程碑拆分的落地步骤、代码片段与测试指引。
+- **附录导航**：
+  - `附录：闪电贷路由设计纲要`——闪电贷调用流程与容错策略。
+  - `附录：Aggregator / Adapter 伪代码`——完整伪代码模板，可直接对照实现。
 
-### 2.1 合约接口清单与调用说明
+## 1. 开发前准备
 
-> 这一节专门汇总链上需要交互的核心接口，便于后端或脚本模块统一封装调用逻辑。
+### 1.1 环境依赖
+- Foundry (`forge`/`cast`) ≥ 1.0：编译、测试、部署 Solidity 合约。
+- Node.js 18+ 与 pnpm（或 yarn）：构建前端脚手架与链下脚本。
+- Go 1.21+：后台服务与 `abigen` 绑定生成。
+- Docker / docker-compose（可选）：在本地启动 Redis、PostgreSQL、RabbitMQ。
+- 多签或 EOA 账户：部署合约与后续治理操作均需签名账户支持。
 
-- **Aggregator（`IAggregator`）**
-    - `function deposit(address asset, uint256 amount, address adapter)`
-        - **用途**：用户入金，Aggregator 托管资产并调用指定 Adapter 完成协议层存款。
-        - **调用方**：后端 API（代表用户签名发送交易）或前端直接发起；需要在调用前完成 ERC20 授权。
-        - **关键参数**：`asset` ERC20 地址；`amount` 存入数量（精度与 token decimals 对齐）；`adapter` 目标协议适配器。
-        - **返回值**：无；通过事件 `Deposited` 提供链上追踪。
-        - **注意事项**：应在调用前校验 Adapter 是否已在 Aggregator 注册，防止任意地址。
-    - `function withdraw(address asset, uint256 amount, address adapter)`
-        - **用途**：用户赎回；Aggregator 执行 Adapter 的取款，将资产返还给调用者。
-        - **调用方**：用户地址；后端不能代替执行 unless 代理执行器。
-        - **关键参数**：必须与仓位记录一致的 `asset` 与 `adapter`；`amount` <= 当前仓位。
-        - **事件**：`Withdrawn(user, adapter, amount)` 用于同步 DB。
-    - `function migrate(address user, address fromAdapter, address toAdapter, uint256 amount, bytes data)`
-        - **用途**：在策略触发时将仓位从协议 A 迁移到 B，可结合闪电贷执行器降低资金成本。
-        - **调用方**：受信任的闪电贷执行合约（`flashExecutor`）。
-        - **参数说明**：
-            - `user`：仓位所属钱包，便于更新存储映射。
-            - `fromAdapter` / `toAdapter`：迁移前后协议适配器地址。
-            - `amount`：迁移的基础资产数量。
-            - `data`：Encoded payload（包含 asset 地址、flashRoute 信息等，可用 `abi.encode` 扩展）。
-        - **安全重点**：仅允许闪电贷执行器调用；应在执行器侧完成实际借贷与偿还流程。
-    - `function getPosition(address user, address asset) external view returns (Position memory)`
-        - **用途**：查询仓位，后端可以在链上校验 DB 记录或构建合并视图。
-        - **场景**：API `status`、Worker 校验迁移前仓位。
+### 1.2 仓库布局约定
 
-- **Adapter（`IAdapter`）**
-    - `function deposit(address asset, uint256 amount)`
-        - **职责**：封装协议特定的存款逻辑，例如 Compound `Mint`、Maker `join`。
-        - **调用顺序**：Aggregator `deposit` 内部调用；需要事先在 Adapter 内部持有对目标协议的授权。
-        - **实现要点**：处理资产授权、转换以及协议返回状态码。
-    - `function withdraw(address asset, uint256 amount, address recipient)`
-        - **职责**：从协议中取出资产并发送至指定地址。
-        - **调用方**：Aggregator `withdraw` / `migrate` 过程。
-        - **安全**：应验证 `recipient` 为 Aggregator 或调用者，避免资产被盗。
-    - `function getSupplyRate(address asset) external view returns (uint256)`
-        - **用途**：提供协议利率（APY 或 APR），用于 rateFetcher 刷新。
-        - **返回值统一**：推荐以 Ray（`1e27`）或 BPS（`1e4`）标准化，便于跨协议对比。
-    - `function getProtocolName() external view returns (bytes32)`
-        - **用途**：标识适配器协议名称，便于后端动态映射。
+```bash
+cd <project-root>/AiFi
+```
 
-- **FlashLoanExecutor（`FlashLoanExecutor` 接口）**
-    - `function executeMigration(address user, address asset, uint256 amount, bytes calldata data)`
-        - **职责**：统筹闪电贷调用；借入资金 → 调用 Aggregator `migrate` → 偿还闪电贷。
-        - **调用方**：后端 Worker 触发的闪电贷提供方（Aave、Balancer 等）回调。
-        - **可扩展字段**：`data` 可携带迁移路径、fee 配置、最小收益等参数。
-        - **错误处理**：需捕获任何外部调用失败，并在失败时回滚整笔交易。
+- `contracts/`：Foundry 项目根目录，包含 `src/`、`test/`、`script/`。
+- `backend/`（建议创建）：Go 服务与 Worker 代码。
+- `deploy/`：部署与迁移脚本，可区分 `mainnet`、`testnet` 子目录。
+- `docs/`：设计与操作文档（当前文件即位于此处）。
+- 更详细的目录说明见 `docs/project-structure.md`。
 
-- **辅助接口**
-    - `MockERC20.mint(address to, uint256 amount)`（仅测试环境）：快速铸造测试资产。
-    - 未来接入闪电贷提供方时的 `IFlashLoanProvider`（建议定义）：
-        - `flashLoan(address receiver, address asset, uint256 amount, bytes calldata params)`
-        - 统一封装 Aave、Balancer、Uniswap 闪电贷差异，便于策略选择最低成本路径。
+### 1.3 关键接口速览
 
-> 建议在 Go 后端中为上述接口生成 ABI 绑定（使用 `abigen`）或使用 `go-ethereum` 的 `bind` 工具生成类型安全客户端，以减少参数编码错误。
+ - 聚合器接口：参考 `docs/contract-interface-reference.md` 第 2 章，包含 `Position` 结构、`deposit/withdraw/borrow/repay/migrate` 签名以及 `MigrationParams` 组合示例。
+ - Adapter 规范：`IAdapter`/`IBorrowingAdapter` 需实现 `deposit`/`withdraw` 及借贷扩展，与文档中的 `adapterData` 约定保持一致。
+ - 闪电贷执行器：`FlashLoanExecutor.executeMigration(IAggregator.MigrationParams calldata params)` 为唯一入口，所有闪电贷自定义参数置于 `params.flash.payload`。
+ - 治理函数：`Aggregator.setAdapter(address adapter, bool allowed)`、`setFlashExecutor(address newExecutor)`（及可选的 `pause/unpause`）须由多签或 `ADMIN_ROLE` 调用，部署后优先完成。
+ - 附录提供完整伪代码，可在实现前对照校验字段、事件与权限处理。
+
+### 1.4 落地顺序建议
+- 阅读第 3 章的“里程碑 1/2”，完成仓库初始化与 Foundry 合约骨架。
+- 按需跳转到里程碑 4~7，补齐 Go 后端、Redis/RabbitMQ、PostgreSQL 等组件。
+- 参考里程碑 8~10 完成测试、CI/CD、安全审计与扩展性规划。
+- 若仅需了解链下执行流程，可先阅读 `附录：闪电贷路由设计纲要`。
+
+---
+
+## 2. 合约与服务概览
+
+> 本章用于建立整体概念，对细节函数/参数的定义，请回看 `docs/contract-interface-reference.md`。
+
+### 2.1 核心组件
+- **Aggregator 合约**：统一维护仓位与 Adapter 白名单，负责存取、借贷、迁移操作，并通过事件对外同步状态。
+- **Adapter 合约**：封装具体协议（Compound、Maker、Aave 等）的交互逻辑，确保上层调用签名统一。
+- **FlashLoanExecutor 合约**：在闪电贷回调中协调 `Aggregator.migrate`，结束后偿还借款。
+- **Go Worker**：监听链下任务，选择闪电贷路线，构造 `MigrationParams` 并触发链上操作。
+- **风控与数据面**：Redis 存储实时利率、RabbitMQ 承担任务分发，PostgreSQL 保存仓位与历史记录。
+
+### 2.2 典型调用顺序
+1. 用户在前端发起 `deposit`，后端仅负责参数校验与交易构造。
+2. Worker 周期性拉取底层协议利率，若触达策略阈值则写入 RabbitMQ 迁移任务。
+3. 任务消费者调用闪电贷提供方，回调中执行 `FlashLoanExecutor.executeMigration(params)`。
+4. 迁移完成后，Worker 重新抓取 `Aggregator.getPosition` 校验仓位并更新数据库。
+5. 若治理需要新增/禁用 Adapter 或更换闪电贷执行器，多签提案调用 `setAdapter` / `setFlashExecutor`，并同步链下配置以免任务执行失败。
+
+### 2.3 伪代码参考
+- 完整伪代码示例详见文档末尾的附录，可作为实现骨架。
+- 若需快速对照数据结构，可先阅读附录再回到本章的里程碑部分。
 
 ---
 
@@ -221,20 +197,61 @@ redis-cli -h localhost ping
 
    interface IAggregator {
        struct Position {
+           bytes32 id;
            address owner;
-           address asset;
-           uint256 amount;
+           address collateralAsset;
            address adapter;
+           uint256 collateralAmount;
+           address debtAsset;
+           uint256 debtAmount;
+           uint256 lastHealthFactor;
        }
 
-       event Deposited(address indexed user, address indexed adapter, uint256 amount);
-       event Withdrawn(address indexed user, address indexed adapter, uint256 amount);
-       event Migrated(address indexed user, address fromAdapter, address toAdapter, uint256 amount);
+       struct DebtLeg {
+           address asset;
+           uint256 amount;
+           bytes adapterData;
+       }
 
-       function deposit(address asset, uint256 amount, address adapter) external;
-       function withdraw(address asset, uint256 amount, address adapter) external;
-       function migrate(address user, address fromAdapter, address toAdapter, uint256 amount, bytes calldata data) external;
-       function getPosition(address user, address asset) external view returns (Position memory);
+       struct CollateralLeg {
+           address asset;
+           uint256 amount;
+           bytes adapterData;
+       }
+
+       struct FlashRoute {
+           bytes32 provider;
+           uint256 feeBps;
+           uint256 maxSlippageBps;
+           bytes payload;
+       }
+
+       struct MigrationParams {
+           bytes32 positionId;
+           address user;
+           address fromAdapter;
+           address toAdapter;
+           CollateralLeg[] collateralOut;
+           CollateralLeg[] collateralIn;
+           DebtLeg[] repayLegs;
+           DebtLeg[] borrowLegs;
+           FlashRoute flash;
+           bytes extra;
+       }
+
+       event Deposited(bytes32 indexed positionId, address indexed user, address indexed adapter, uint256 amount, bytes extra);
+       event Withdrawn(bytes32 indexed positionId, address indexed user, address indexed adapter, uint256 amount, bytes extra);
+       event Borrowed(bytes32 indexed positionId, address indexed user, address indexed adapter, address asset, uint256 amount, bytes data);
+       event Repaid(bytes32 indexed positionId, address indexed user, address indexed adapter, address asset, uint256 amount, bytes data);
+       event Migrated(bytes32 indexed positionId, address indexed user, address fromAdapter, address toAdapter, bytes data);
+
+       function deposit(bytes32 positionId, address collateralAsset, uint256 amount, address adapter, bytes calldata extra) external returns (bytes32);
+       function withdraw(bytes32 positionId, uint256 amount, bytes calldata extra) external;
+       function borrow(bytes32 positionId, address debtAsset, uint256 amount, bytes calldata data) external;
+       function repay(bytes32 positionId, address debtAsset, uint256 amount, bytes calldata data) external;
+       function migrate(MigrationParams calldata params) external;
+       function getPosition(bytes32 positionId) external view returns (Position memory);
+       function derivePositionId(address owner, address collateralAsset, address adapter, bytes32 salt) external pure returns (bytes32);
    }
    ```
 
@@ -244,10 +261,17 @@ redis-cli -h localhost ping
    pragma solidity ^0.8.24;
 
    interface IAdapter {
-       function deposit(address asset, uint256 amount) external;
-       function withdraw(address asset, uint256 amount, address recipient) external;
+       function deposit(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external;
+       function withdraw(address asset, uint256 amount, address recipient, bytes calldata data) external;
        function getSupplyRate(address asset) external view returns (uint256);
        function getProtocolName() external view returns (bytes32);
+   }
+
+   interface IBorrowingAdapter is IAdapter {
+       function borrow(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external;
+       function repay(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external;
+       function getHealthFactor(address account) external view returns (uint256);
+       function getDebt(address account, address asset) external view returns (uint256);
    }
    ```
 
@@ -256,8 +280,10 @@ redis-cli -h localhost ping
    // SPDX-License-Identifier: MIT
    pragma solidity ^0.8.24;
 
+   import {IAggregator} from "../IAggregator.sol";
+
    interface FlashLoanExecutor {
-       function executeMigration(address user, address asset, uint256 amount, bytes calldata data) external;
+       function executeMigration(IAggregator.MigrationParams calldata params) external;
    }
    ```
 
@@ -270,33 +296,70 @@ redis-cli -h localhost ping
    import {IAdapter} from "./adapters/IAdapter.sol";
 
    contract Aggregator is IAggregator {
-       mapping(address => mapping(address => Position)) private positions;
+       mapping(bytes32 => Position) private positions;
+       mapping(address => bool) public isAdapterAllowed;
        address public flashExecutor;
 
        constructor(address flashExecutor_) {
            flashExecutor = flashExecutor_;
        }
 
-       function deposit(address asset, uint256 amount, address adapter) external override {
-           // TODO: 校验 amount、更新仓位映射、调用 Adapter.deposit 并发出事件
+       function setAdapter(address adapter, bool allowed) external {
+           // TODO: 结合 Ownable/AccessControl 做访问控制
+           isAdapterAllowed[adapter] = allowed;
        }
 
-       function withdraw(address asset, uint256 amount, address adapter) external override {
-           // TODO: 校验仓位余额、调用 Adapter.withdraw；失败需 revert
+       function deposit(
+           bytes32 positionId,
+           address collateralAsset,
+           uint256 amount,
+           address adapter,
+           bytes calldata extra
+       ) external override returns (bytes32 newPositionId) {
+           // TODO: 生成/校验 positionId、校验授权、调用 Adapter.deposit 并记录事件
        }
 
-       function migrate(
-           address user,
-           address fromAdapter,
-           address toAdapter,
+       function withdraw(
+           bytes32 positionId,
+           uint256 amount,
+           bytes calldata extra
+       ) external override {
+           // TODO: 校验健康度/债务余额，调用 Adapter.withdraw 并返还资产
+       }
+
+       function borrow(
+           bytes32 positionId,
+           address debtAsset,
            uint256 amount,
            bytes calldata data
        ) external override {
-           // TODO: 仅允许 flashExecutor 调用，切换仓位 adapter，结合 data 解码 flashRoute
+           // TODO: 仅允许仓位所有者调用，调用 IBorrowingAdapter.borrow，更新 debtAmount 与 healthFactor
        }
 
-       function getPosition(address user, address asset) external view override returns (Position memory) {
-           // TODO: 返回 positions[user][asset]
+       function repay(
+           bytes32 positionId,
+           address debtAsset,
+           uint256 amount,
+           bytes calldata data
+       ) external override {
+           // TODO: 拉取用户资金、调用 IBorrowingAdapter.repay，更新 debtAmount 与 healthFactor
+       }
+
+       function migrate(MigrationParams calldata params) external override {
+           // TODO: 仅允许 flashExecutor 调用，执行多资产迁移并偿还/重建债务
+       }
+
+       function getPosition(bytes32 positionId) external view override returns (Position memory) {
+           // TODO: 返回 positions[positionId]
+       }
+
+       function derivePositionId(
+           address owner,
+           address collateralAsset,
+           address adapter,
+           bytes32 salt
+       ) public pure override returns (bytes32) {
+           return keccak256(abi.encode(owner, collateralAsset, adapter, salt));
        }
    }
    ```
@@ -318,11 +381,11 @@ redis-cli -h localhost ping
            cToken = _cToken;
        }
 
-       function deposit(address asset, uint256 amount) external override {
+       function deposit(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external override {
            // TODO: approve + mint
        }
 
-       function withdraw(address asset, uint256 amount, address recipient) external override {
+       function withdraw(address asset, uint256 amount, address recipient, bytes calldata data) external override {
            // TODO: redeem
        }
 
@@ -351,12 +414,12 @@ redis-cli -h localhost ping
            ilk = _ilk;
        }
 
-       function deposit(address asset, uint256 amount) external override {
-           asset; amount; // TODO: join + lock
+       function deposit(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external override {
+           asset; amount; onBehalfOf; data; // TODO: join + lock
        }
 
-       function withdraw(address asset, uint256 amount, address recipient) external override {
-           asset; amount; recipient; // TODO: free
+       function withdraw(address asset, uint256 amount, address recipient, bytes calldata data) external override {
+           asset; amount; recipient; data; // TODO: free
        }
 
        function getSupplyRate(address asset) external view override returns (uint256) {
@@ -376,6 +439,7 @@ redis-cli -h localhost ping
    pragma solidity ^0.8.24;
 
    import {FlashLoanExecutor} from "./FlashLoanExecutor.sol";
+   import {IAggregator} from "../IAggregator.sol";
 
    contract MockFlashExecutor is FlashLoanExecutor {
        address public immutable aggregator;
@@ -384,8 +448,8 @@ redis-cli -h localhost ping
            aggregator = _aggregator;
        }
 
-       function executeMigration(address user, address asset, uint256 amount, bytes calldata data) external override {
-           aggregator; user; asset; amount; data;
+       function executeMigration(IAggregator.MigrationParams calldata params) external override {
+           aggregator; params;
            // TODO: integrate with aggregator.migrate
        }
    }
@@ -449,15 +513,15 @@ redis-cli -h localhost ping
 
        function testDeposit() public {
            token.approve(address(aggregator), 100 ether);
-           aggregator.deposit(address(token), 100 ether, address(this));
+           bytes32 positionId = aggregator.deposit(bytes32(0), address(token), 100 ether, address(this), bytes(""));
 
-           IAggregator.Position memory p = aggregator.getPosition(address(this), address(token));
-           assertEq(p.amount, 100 ether);
+           IAggregator.Position memory p = aggregator.getPosition(positionId);
+           assertEq(p.collateralAmount, 100 ether);
        }
 
        function testWithdrawRevertsWhenInsufficient() public {
            vm.expectRevert();
-           aggregator.withdraw(address(token), 1 ether, address(this));
+           aggregator.withdraw(bytes32(uint256(1)), 1 ether, bytes(""));
        }
    }
    ```
@@ -576,6 +640,8 @@ redis-cli -h localhost ping
    func RegisterRoutes(r chi.Router, db *sql.DB) {
        r.Post("/deposit", depositHandler(db))
        r.Post("/withdraw", withdrawHandler(db))
+        r.Post("/borrow", borrowHandler(db))
+        r.Post("/repay", repayHandler(db))
        r.Get("/status/{user}", statusHandler(db))
    }
 
@@ -592,6 +658,20 @@ redis-cli -h localhost ping
            w.WriteHeader(http.StatusAccepted)
        }
    }
+
+    func borrowHandler(db *sql.DB) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+            _ = db
+            w.WriteHeader(http.StatusAccepted)
+        }
+    }
+
+    func repayHandler(db *sql.DB) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+            _ = db
+            w.WriteHeader(http.StatusAccepted)
+        }
+    }
 
    func statusHandler(db *sql.DB) http.HandlerFunc {
        return func(w http.ResponseWriter, r *http.Request) {
@@ -692,12 +772,15 @@ redis-cli -h localhost ping
    ```json
    {
      "id": "uuid",
-     "user": "0x...",
-     "asset": "0x...",
-     "from_adapter": "0x...",
-     "to_adapter": "0x...",
-     "amount": "1000000000000000000",
+    "user": "0x...",
+    "collateral_asset": "0x...",
+    "from_adapter": "0x...",
+    "to_adapter": "0x...",
+    "collateral_amount": "1000000000000000000",
      "rate_diff_bps": 120,
+            "debt_asset": "0x...",
+            "debt_amount": "500000000000000000",
+            "debt_plan": {"mode": "rebuild", "target_hf": "1200000000000000000000000000"},
      "strategy": "flashloan",
      "created_at": "2025-05-01T12:00:00Z"
    }
@@ -712,14 +795,19 @@ redis-cli -h localhost ping
    ```go
    package service
 
+    import "encoding/json"
+
    type MigrationTask struct {
-       ID          string `json:"id"`
-       User        string `json:"user"`
-       Asset       string `json:"asset"`
-       FromAdapter string `json:"from_adapter"`
-       ToAdapter   string `json:"to_adapter"`
-       Amount      string `json:"amount"`
-       RateDiffBps int    `json:"rate_diff_bps"`
+       ID              string          `json:"id"`
+       User            string          `json:"user"`
+       CollateralAsset string          `json:"collateral_asset"`
+       FromAdapter     string          `json:"from_adapter"`
+       ToAdapter       string          `json:"to_adapter"`
+    CollateralAmount string         `json:"collateral_amount"`
+       RateDiffBps     int             `json:"rate_diff_bps"`
+       DebtAsset   string `json:"debt_asset,omitempty"`
+       DebtAmount  string `json:"debt_amount,omitempty"`
+       DebtPlan    json.RawMessage `json:"debt_plan,omitempty"`
    }
 
    type Queue interface {
@@ -745,20 +833,27 @@ redis-cli -h localhost ping
    CREATE TABLE positions (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        user_id UUID NOT NULL REFERENCES users(id),
-       asset_address TEXT NOT NULL,
+       collateral_asset_address TEXT NOT NULL,
+       collateral_amount NUMERIC(78, 0) NOT NULL,
        adapter_address TEXT NOT NULL,
-       amount NUMERIC(78, 0) NOT NULL,
+       debt_asset_address TEXT,
+       debt_amount NUMERIC(78, 0) NOT NULL DEFAULT 0,
+       last_health_factor_ray NUMERIC(78, 0) NOT NULL DEFAULT 0,
        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (user_id, collateral_asset_address)
    );
 
    CREATE TABLE migration_task (
        id UUID PRIMARY KEY,
        user_id UUID NOT NULL REFERENCES users(id),
-       asset_address TEXT NOT NULL,
+       collateral_asset_address TEXT NOT NULL,
        from_adapter TEXT NOT NULL,
        to_adapter TEXT NOT NULL,
-       amount NUMERIC(78, 0) NOT NULL,
+       collateral_amount NUMERIC(78, 0) NOT NULL,
+       debt_asset_address TEXT,
+       debt_amount NUMERIC(78, 0) NOT NULL DEFAULT 0,
+       debt_plan JSONB,
        rate_diff_bps INT NOT NULL,
        status TEXT NOT NULL DEFAULT 'pending',
        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -776,7 +871,7 @@ redis-cli -h localhost ping
 
 3. **索引建议**
    ```sql
-   CREATE INDEX positions_user_asset_idx ON positions(user_id, asset_address);
+    CREATE INDEX positions_user_collateral_idx ON positions(user_id, collateral_asset_address);
    CREATE INDEX rate_history_asset_protocol_idx ON rate_history(asset_address, protocol);
    CREATE INDEX migration_task_status_idx ON migration_task(status);
    ```
@@ -1049,84 +1144,6 @@ interface IERC20Minimal {
     function approve(address spender, uint256 value) external returns (bool);
 }
 
-interface IAdapterLike {
-    function deposit(address asset, uint256 amount) external;
-    function withdraw(address asset, uint256 amount, address recipient) external;
-}
-
-contract AggregatorPseudo {
-    struct Position {
-        address owner;
-        address asset;
-        uint256 amount;
-        address adapter;
-    }
-
-    mapping(address => mapping(address => Position)) internal positions;
-    mapping(address => bool) public isAdapterAllowed;
-    address public immutable flashExecutor;
-
-    constructor(address flashExecutor_) {
-        flashExecutor = flashExecutor_;
-    }
-
-    function setAdapter(address adapter, bool allowed) external {
-        // 真实实现应加上访问控制（如 Ownable）
-        isAdapterAllowed[adapter] = allowed;
-    }
-
-    function deposit(address asset, uint256 amount, address adapter) external {
-        require(amount > 0, "amount=0");
-        require(isAdapterAllowed[adapter], "adapter not allowed");
-
-        Position storage position = positions[msg.sender][asset];
-        if (position.owner == address(0)) {
-            position.owner = msg.sender;
-            position.asset = asset;
-        }
-        position.adapter = adapter;
-        position.amount += amount;
-
-        require(IERC20Minimal(asset).transferFrom(msg.sender, address(this), amount), "transferFrom failed");
-        require(IERC20Minimal(asset).approve(adapter, amount), "approve failed");
-        IAdapterLike(adapter).deposit(asset, amount);
-    }
-
-    function withdraw(address asset, uint256 amount, address adapter) external {
-        Position storage position = positions[msg.sender][asset];
-        require(position.amount >= amount, "insufficient");
-        require(position.adapter == adapter, "adapter mismatch");
-
-        position.amount -= amount;
-        IAdapterLike(adapter).withdraw(asset, amount, address(this));
-        require(IERC20Minimal(asset).transfer(msg.sender, amount), "transfer failed");
-    }
-
-    function migrate(
-        address user,
-        address fromAdapter,
-        address toAdapter,
-        uint256 amount,
-        bytes calldata payload
-    ) external {
-        require(msg.sender == flashExecutor, "only flash");
-
-        (address asset, bytes32 provider,) = abi.decode(payload, (address, bytes32, bytes));
-        Position storage position = positions[user][asset];
-        require(position.adapter == fromAdapter, "from mismatch");
-
-        IAdapterLike(fromAdapter).withdraw(asset, amount, address(this));
-        require(IERC20Minimal(asset).approve(toAdapter, amount), "approve dest failed");
-        IAdapterLike(toAdapter).deposit(asset, amount);
-
-        position.adapter = toAdapter;
-        provider; // 在真实实现中根据 provider 选择闪电贷路线
-    }
-
-    function getPosition(address user, address asset) external view returns (Position memory) {
-        return positions[user][asset];
-    }
-}
 ```
 
 ### Adapter 合约伪代码（示例）
@@ -1146,16 +1163,26 @@ abstract contract BaseAdapter {
         aggregator = aggregator_;
     }
 
-    function deposit(address asset, uint256 amount) external onlyAggregator {
-        _deposit(asset, amount);
+    function deposit(
+        address asset,
+        uint256 amount,
+        address onBehalfOf,
+        bytes calldata data
+    ) external onlyAggregator {
+        _deposit(asset, amount, onBehalfOf, data);
     }
 
-    function withdraw(address asset, uint256 amount, address recipient) external onlyAggregator {
-        _withdraw(asset, amount, recipient);
+    function withdraw(
+        address asset,
+        uint256 amount,
+        address recipient,
+        bytes calldata data
+    ) external onlyAggregator {
+        _withdraw(asset, amount, recipient, data);
     }
 
-    function _deposit(address asset, uint256 amount) internal virtual;
-    function _withdraw(address asset, uint256 amount, address recipient) internal virtual;
+    function _deposit(address asset, uint256 amount, address onBehalfOf, bytes calldata data) internal virtual;
+    function _withdraw(address asset, uint256 amount, address recipient, bytes calldata data) internal virtual;
 }
 ```
 
@@ -1172,25 +1199,73 @@ interface IERC20Minimal {
 interface ICTokenLike {
     function mint(uint256 amount) external returns (uint256);
     function redeemUnderlying(uint256 amount) external returns (uint256);
+    function borrow(uint256 borrowAmount) external returns (uint256);
+    function repayBorrow(uint256 repayAmount) external returns (uint256);
 }
 
-contract CompoundAdapterPseudo is BaseAdapter {
-    address public immutable asset;
-    address public immutable cToken;
+interface IComptrollerLike {
+    function enterMarkets(address[] calldata cTokens) external returns (uint256[] memory);
+    function getAccountLiquidity(address account) external view returns (uint256 error, uint256 liquidity, uint256 shortfall);
+}
 
-    constructor(address aggregator_, address asset_, address cToken_) BaseAdapter(aggregator_) {
-        asset = asset_;
-        cToken = cToken_;
+contract CompoundAdapterPseudo is BaseAdapter, IBorrowingAdapterLike {
+    address public immutable collateralAsset;
+    address public immutable debtAsset;
+    address public immutable supplyMarket; // cToken for collateral
+    address public immutable debtMarket;   // cToken for borrow asset
+    address public immutable comptroller;
+
+    constructor(
+        address aggregator_,
+        address collateralAsset_,
+        address debtAsset_,
+        address supplyMarket_,
+        address debtMarket_,
+        address comptroller_
+    ) BaseAdapter(aggregator_) {
+        collateralAsset = collateralAsset_;
+        debtAsset = debtAsset_;
+        supplyMarket = supplyMarket_;
+        debtMarket = debtMarket_;
+        comptroller = comptroller_;
+
+        address[] memory markets = new address[](2);
+        markets[0] = supplyMarket;
+        markets[1] = debtMarket;
+        IComptrollerLike(comptroller).enterMarkets(markets);
     }
 
     function _deposit(address, uint256 amount) internal override {
-        require(IERC20Minimal(asset).approve(cToken, amount), "approve failed");
-        require(ICTokenLike(cToken).mint(amount) == 0, "mint failed");
+        require(IERC20Minimal(collateralAsset).approve(supplyMarket, amount), "approve failed");
+        require(ICTokenLike(supplyMarket).mint(amount) == 0, "mint failed");
     }
 
     function _withdraw(address, uint256 amount, address recipient) internal override {
-        require(ICTokenLike(cToken).redeemUnderlying(amount) == 0, "redeem failed");
-        require(IERC20Minimal(asset).transfer(recipient, amount), "transfer failed");
+        require(ICTokenLike(supplyMarket).redeemUnderlying(amount) == 0, "redeem failed");
+        require(IERC20Minimal(collateralAsset).transfer(recipient, amount), "transfer failed");
+    }
+
+    // --- IBorrowingAdapterLike ---
+
+    function borrow(address asset, uint256 amount, address onBehalfOf, bytes calldata) external override onlyAggregator {
+        require(asset == debtAsset, "asset mismatch");
+        require(ICTokenLike(debtMarket).borrow(amount) == 0, "borrow failed");
+        require(IERC20Minimal(debtAsset).transfer(onBehalfOf, amount), "transfer failed");
+    }
+
+    function repay(address asset, uint256 amount, address, bytes calldata) external override onlyAggregator {
+        require(asset == debtAsset, "asset mismatch");
+        require(IERC20Minimal(debtAsset).approve(debtMarket, amount), "approve failed");
+        require(ICTokenLike(debtMarket).repayBorrow(amount) == 0, "repay failed");
+    }
+
+    function getHealthFactor(address account) external view override returns (uint256) {
+        (uint256 error, uint256 liquidity, uint256 shortfall) = IComptrollerLike(comptroller).getAccountLiquidity(account);
+        if (error != 0 || shortfall > 0) {
+            return 0;
+        }
+        // 健康度近似：将可用流动性放大到 Ray 精度；Compound 没有原生 HF，示例中使用 1e27 基准
+        return liquidity * 1e9; // 近似映射，实际实现需结合价格预言机
     }
 }
 ```
@@ -1202,6 +1277,7 @@ pragma solidity ^0.8.24;
 
 interface IVatLike {
     function frob(bytes32 ilk, int256 dink, int256 dart) external;
+    function urns(bytes32 ilk, address usr) external view returns (uint256 ink, uint256 art);
 }
 
 interface IGemJoinLike {
@@ -1209,36 +1285,132 @@ interface IGemJoinLike {
     function exit(address usr, uint256 wad) external;
 }
 
-contract MakerAdapterPseudo is BaseAdapter {
-    address public immutable asset;
+interface IDaiJoinLike {
+    function join(address usr, uint256 wad) external;
+    function exit(address usr, uint256 wad) external;
+}
+
+contract MakerAdapterPseudo is BaseAdapter, IBorrowingAdapterLike {
+    address public immutable collateralAsset; // e.g. WETH
+    address public immutable dai;
     bytes32 public immutable ilk;
     address public immutable vat;
     address public immutable gemJoin;
+    address public immutable daiJoin;
 
     constructor(
         address aggregator_,
-        address asset_,
+        address collateralAsset_,
+        address dai_,
         bytes32 ilk_,
         address vat_,
-        address gemJoin_
+        address gemJoin_,
+        address daiJoin_
     ) BaseAdapter(aggregator_) {
-        asset = asset_;
+        collateralAsset = collateralAsset_;
+        dai = dai_;
         ilk = ilk_;
         vat = vat_;
         gemJoin = gemJoin_;
+        daiJoin = daiJoin_;
     }
 
     function _deposit(address, uint256 amount) internal override {
-        require(IERC20Minimal(asset).approve(gemJoin, amount), "approve failed");
+        require(IERC20Minimal(collateralAsset).approve(gemJoin, amount), "approve failed");
         IGemJoinLike(gemJoin).join(address(this), amount);
-        IVatLike(vat).frob(ilk, int256(uint256(amount)), 0);
+        IVatLike(vat).frob(ilk, int256(uint256(amount)), 0); // 简化：假设已按 WAD 对齐
     }
 
     function _withdraw(address, uint256 amount, address recipient) internal override {
         IVatLike(vat).frob(ilk, -int256(uint256(amount)), 0);
         IGemJoinLike(gemJoin).exit(recipient, amount);
     }
+
+    // --- IBorrowingAdapterLike ---
+
+    function borrow(address asset, uint256 amount, address onBehalfOf, bytes calldata) external override onlyAggregator {
+        require(asset == dai, "asset mismatch");
+        IVatLike(vat).frob(ilk, 0, int256(uint256(amount))); // 借出等量 DAI，实际实现需换算 `dart`
+        IDaiJoinLike(daiJoin).exit(onBehalfOf, amount);
+    }
+
+    function repay(address asset, uint256 amount, address, bytes calldata) external override onlyAggregator {
+        require(asset == dai, "asset mismatch");
+        require(IERC20Minimal(dai).approve(daiJoin, amount), "approve failed");
+        IDaiJoinLike(daiJoin).join(address(this), amount);
+        IVatLike(vat).frob(ilk, 0, -int256(uint256(amount)));
+    }
+
+    function getHealthFactor(address account) external view override returns (uint256) {
+        (uint256 ink, uint256 art) = IVatLike(vat).urns(ilk, account);
+        if (art == 0) {
+            return type(uint256).max;
+        }
+        // 近似：用抵押/债务比率映射为 Ray；真实实现需结合 Spot/Oracle 价格
+        return (ink * 1e27) / art;
+    }
 }
 ```
 
-> 其他协议（如 Aave、Spark、Morpho）可基于 `BaseAdapter` 独立实现各自的存取逻辑与附属接口。
+#### Aave Adapter 示例（含借贷）
+
+```solidity
+pragma solidity ^0.8.24;
+
+interface IAavePoolLike {
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
+    function borrow(address asset, uint256 amount, uint8 interestRateMode, uint16 referralCode, address onBehalfOf) external;
+    function repay(address asset, uint256 amount, uint8 interestRateMode, address onBehalfOf) external returns (uint256);
+    function getUserAccountData(address user) external view returns (
+        uint256 totalCollateralBase,
+        uint256 totalDebtBase,
+        uint256 availableBorrowsBase,
+        uint256 currentLiquidationThreshold,
+        uint256 ltv,
+        uint256 healthFactor
+    );
+}
+
+contract AaveAdapterPseudo is BaseAdapter, IBorrowingAdapterLike {
+    address public immutable asset;
+    address public immutable pool;
+    uint8 public immutable variableRateMode = 2; // 1=stable,2=variable
+
+    constructor(address aggregator_, address asset_, address pool_) BaseAdapter(aggregator_) {
+        asset = asset_;
+        pool = pool_;
+    }
+
+    function _deposit(address, uint256 amount) internal override {
+        require(IERC20Minimal(asset).approve(pool, amount), "approve failed");
+        IAavePoolLike(pool).supply(asset, amount, address(this), 0);
+    }
+
+    function _withdraw(address, uint256 amount, address recipient) internal override {
+        IAavePoolLike(pool).withdraw(asset, amount, recipient);
+    }
+
+    // --- IBorrowingAdapterLike ---
+
+    function borrow(address debtAsset, uint256 amount, address onBehalfOf, bytes calldata data) external override onlyAggregator {
+        uint8 rateMode = data.length > 0 ? abi.decode(data, (uint8)) : variableRateMode;
+        IAavePoolLike(pool).borrow(debtAsset, amount, rateMode, 0, address(this));
+        require(IERC20Minimal(debtAsset).transfer(onBehalfOf, amount), "transfer out failed");
+    }
+
+    function repay(address debtAsset, uint256 amount, address onBehalfOf, bytes calldata data) external override onlyAggregator {
+        uint8 rateMode = data.length > 0 ? abi.decode(data, (uint8)) : variableRateMode;
+        require(IERC20Minimal(debtAsset).approve(pool, amount), "approve failed");
+        IAavePoolLike(pool).repay(debtAsset, amount, rateMode, address(this));
+        onBehalfOf; // aggregator 代表账户，不额外使用
+    }
+
+    function getHealthFactor(address account) external view override returns (uint256) {
+        (, , , , , uint256 hf) = IAavePoolLike(pool).getUserAccountData(account);
+        return hf;
+    }
+}
+```
+
+> Spark、Morpho 等其他协议可仿照以上模式，分别继承 `BaseAdapter` 或 `IBorrowingAdapter`，在 `_deposit/_withdraw/borrow/repay` 中填入协议特定逻辑即可。
