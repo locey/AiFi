@@ -65,7 +65,7 @@ interface IAggregator {
     event Migrated(bytes32 indexed positionId, address indexed user, address fromAdapter, address toAdapter, bytes data);
     event AdapterStatusChanged(address indexed adapter, bool allowed);
 
-    function deposit(bytes32 positionId, address collateralAsset, uint256 amount, address adapter, bytes calldata extra) external payable returns(bytes32);
+    function deposit(bytes32 positionId, address collateralAsset, uint256 amount, address adapter, bytes calldata extra) external returns(bytes32);
     function withdraw(bytes32 positionId, uint256 amount, bytes calldata extra) external;
     function borrow(bytes32 positionId, address debtAsset, uint256 amount, bytes calldata data) external;
     function repay(bytes32 positionId, address debtAsset, uint256 amount, bytes calldata data) external;

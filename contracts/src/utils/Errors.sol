@@ -15,3 +15,6 @@ error InvalidETHAmount();    // ETH 数量不匹配
 error ETHNotAccepted();      // 不接受 ETH
 error HealthFactorTooLow();    // 健康因子过低
 error NotFlashExecutor();    // 非 Flash Executor
+error NotAggregator();        // 非 Aggregator
+error ETHTransferFailed();   // ETH 转账失败
+error NoAssetsInComet();   // Compound V3 市场中没有资产
