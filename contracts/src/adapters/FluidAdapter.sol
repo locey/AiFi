@@ -39,7 +39,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
 
     // 记录用户对应的 Fluid 仓位 ID
     // Adapter 代持有 NFT，但逻辑上归属于用户
-    mapping(address => uint256) public userBftIds;
+    mapping(address => uint256) public userNftIds;
 
     modifier onlyAggregator() {
         if (msg.sender != aggregator) revert NotAggregator();
@@ -65,7 +65,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
         // 授权 Vault 扣款
         SafeERC20.forceApprove(IERC20(asset), vault, amount);
         // 获取用户现有的 NFT ID (如果是新用户则是 0)
-        uint256 nftId = userBftIds[onBehalfOf];
+        uint256 nftId = userNftIds[onBehalfOf];
 
         // 调用 Vault 进行存款操作
         // newCol: +amount (存入)
@@ -79,7 +79,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
         );
         // 如果是新开仓，记录下 NFT ID
         if (nftId == 0) {
-            userBftIds[onBehalfOf] = newNftId;
+            userNftIds[onBehalfOf] = newNftId;
         }
     }
     function withdraw(
@@ -91,7 +91,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
     ) external override onlyAggregator {
         if (asset != collateralToken) revert InvalidAsset();
 
-        uint256 nftId = userBftIds[owner];
+        uint256 nftId = userNftIds[owner];
         if (nftId == 0) revert InvalidPosition();
 
         // newCol: -amount (取出，注意负号)
@@ -113,7 +113,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
     ) external override onlyAggregator {
         if (asset != debtToken) revert InvalidAsset();
 
-        uint256 nftId = userBftIds[owner];
+        uint256 nftId = userNftIds[owner];
         // 必须先存款才能借款
         if (nftId == 0) revert InvalidPosition();
 
@@ -139,7 +139,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         // 授权 Vault 扣款
         SafeERC20.forceApprove(IERC20(asset), vault, amount);
-        uint256 nftId = userBftIds[recipient];
+        uint256 nftId = userNftIds[recipient];
         if (nftId == 0) revert InvalidPosition();
 
         // newCol: 0
@@ -153,7 +153,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
         );
     }
     function getHealthFactor(address account) external view override returns (uint256) {
-        uint256 nftId = userBftIds[account];
+        uint256 nftId = userNftIds[account];
         // 如果没有仓位，健康值无穷大
         if (nftId == 0) return type(uint256).max;
         // 获取 Raw Amounts （不含利息底层份额）
@@ -185,7 +185,7 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
     }
     function getDebt(address account, address asset) external view override returns (uint256) {
         if (asset != debtToken) revert InvalidAsset();
-        uint256 nftId = userBftIds[account];
+        uint256 nftId = userNftIds[account];
         if (nftId == 0) return 0;
         // 获取 Raw Amount
         (, uint256 debtRaw) = IFluidVault(vault).fetchPositionData(nftId);
@@ -197,8 +197,28 @@ contract FluidAdapter is IAdapter, IBorrowingAdapter {
         // Fluid 的 ExchangePrice 精度通常是 1e12
         return (debtRaw * borrowExPrice) / 1e12;
     }
-    function getSupplyRate(address) external view override returns (uint256) { return 0; }
-    function getBorrowRate(address) external view override returns (uint256) { return 0; }
+    function getSupplyRate(address asset) external view override returns (uint256) { 
+        // 只有抵押次产才有存款收益
+        if (asset != collateralToken) return 0;
+
+        // exchangePricesAndRates 返回: (supplyPrice, borrowPrice, supplyRate, borrowRate)
+        ( , , uint256 ratePerSecond, ) = IFluidVault(vault).exchangePricesAndRates();
+        
+        // 转换为年化利率 (APY)
+        return ratePerSecond * 365 days;
+    }
+
+    function getBorrowRate(address asset) external view override returns (uint256) {
+        // 只有债务资产才有借款利率
+        if (asset != debtToken) return 0;
+
+        // exchangePricesAndRates 返回: (supplyPrice, borrowPrice, supplyRate, borrowRate)
+        ( , , , uint256 ratePerSecond) = IFluidVault(vault).exchangePricesAndRates();
+        
+        // 转换为年化利率 (APY)
+        return ratePerSecond * 365 days;
+    }
+
     function getProtocolName() external pure override returns (bytes32) {
         return "FLUID";
     }
