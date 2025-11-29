@@ -69,11 +69,9 @@ AiFi/
 │   ├── adapters/
 │   │   ├── compound.md
 │   │   ├── maker.md
-│   │   └── flash-routing.md
-│   ├── backend/
-│   │   ├── api-design.md
-│   │   └── worker-flow.md
-│   └── SECURITY.md
+│   │   └── aave.md
+│   ├── governance/             # 可选：多签提案模板、参数变更记录
+│   └── README.md               # 可选：文档索引或贡献指南
 │
 ├── scripts/                     # 辅助脚本 (bash / python)
 │   ├── generate-abi.sh
@@ -96,8 +94,8 @@ AiFi/
 - **contracts/**：以 Foundry 为基础，模块化区分核心 Aggregator、Adapter、Flash Loan Provider，每个子模块可独立扩展。
 - **backend/**：Go 服务按照 `cmd` / `internal` / `pkg` 规范组织，支持模块化业务逻辑与重用组件；`service/flashrouter` 专门处理闪电贷路线选择。
 - **infra/**：统一存放容器配置、数据库迁移、Kubernetes 文件，方便 DevOps 管理。
-- **docs/**：聚合教程、接口说明、子模块文档。按协议 / 后端功能拆分，辅助协作。
-- **docs/**：聚合教程、接口说明、子模块文档。可与 `lending-aggregator-tutorial.md`、`contract-interface-reference.md` 等主文档联动，保持知识库一致性。
+- **docs/**：核心文档仓库，当前包含聚合器教程、接口说明及 `adapters/` 下的协议接入指南。建议增加 `governance/` 记录多签提案与参数变更，以及文档索引 README 便于团队导航。
+- **governance/**（可选）：记录多签配置、Timelock 提案、参数变更 Runbook，与 `docs/SECURITY.md` 联动管理权限更新历史。
 - **scripts/**：常用自动化脚本（生成 ABI、数据库初始化、运行测试），便于项目启动与 CI 集成。
 - **.github/workflows/**： CI/CD 配置拆分为通用 CI、合约测试、后端测试，可根据需要加上部署流程。
 

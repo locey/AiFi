@@ -6,7 +6,61 @@
 
 ---
 
-## 0. 平台架构总览
+## 0. 快速上手
+
+### 0.1 依赖清单
+- Foundry (`forge`/`cast`) ≥ 1.0：编译、测试、部署智能合约。
+- Node.js 18+ 与 pnpm/yarn：运行前端脚手架或链下脚本。
+- Go 1.21+：生成 `abigen` 绑定、编写后台服务。
+- Docker / docker-compose（可选）：快速启动 Redis、PostgreSQL、RabbitMQ。
+- 一个可签名账户（EOA 或 Gnosis Safe），用于部署与治理操作。
+
+### 0.2 部署与初始化流程
+1. `forge build` 确认合约编译无误；根据目标网络准备 `.env` 与部署脚本。
+2. 部署 `Aggregator` 合约并记录地址；部署 `FlashLoanExecutor`，构造函数写入 Aggregator 地址。
+3. 调用 `Aggregator.setAdapter(adapter, true)` 注册至少一个 Adapter；必要时在 Adapter 端设置底层协议授权。
+4. 更新治理权限：`transferOwnership` 给多签 → 多签执行 `setFlashExecutor`、`setAdapter` 等初始化操作。
+5. 链下初始化：迁移数据库 schema、配置 Redis 阈值、启动 Worker 并写入 `flashExecutor` 与 Adapter 地址表。
+
+### 0.3 合约最小调用序列
+```solidity
+IAggregator aggregator = IAggregator(0x...);
+address adapter = 0x...;
+address collateralAsset = 0x...;
+bytes32 positionId = aggregator.derivePositionId(user, collateralAsset, adapter, salt);
+
+IAggregator.DepositExtra memory extra = IAggregator.DepositExtra({
+  permit: bytes(""),
+  minShares: 0,
+  adapterParams: bytes("")
+});
+
+aggregator.deposit(
+  positionId,
+  collateralAsset,
+  amount,
+  adapter,
+  abi.encode(extra)
+);
+
+IAggregator.Position memory pos = aggregator.getPosition(positionId);
+
+aggregator.withdraw(positionId, redeemAmount, bytes(""));
+```
+
+### 0.4 链下 Worker 工作流
+- 监听 `Deposited`、`Borrowed`、`Migrated` 事件，实时同步 PostgreSQL 仓位与债务表。
+- 定时抓取各 Adapter 的供需利率并写入 Redis，触发策略判定（阈值满足则投递迁移任务到 RabbitMQ）。
+- 收到迁移任务后，组合 `MigrationParams`，向闪电贷提供方发起调用，并在回调中执行 `FlashLoanExecutor.executeMigration`。
+- 迁移完成后重新抓取链上仓位快照，与 Redis 缓存对账。
+
+### 0.5 常见踩坑
+- 忽略 `setAdapter` 或权限配置，导致 Aggregator 调用时 `adapter not allowed`。
+- `flashExecutor` 地址未更新即触发迁移，`migrate` 将直接 revert。
+- `MigrationParams` 中的数组顺序应满足“先清算旧仓位后构建新仓位”，与实际 Adapter 执行顺序保持一致。
+- Foundry fork 测试需要预先为多签/Worker 地址注入足够的 Token 与 ETH；否则 approve、还款会失败。
+
+## 1. 平台架构总览
 
 ```mermaid
 flowchart LR
@@ -78,44 +132,177 @@ flowchart LR
 
 ---
 
-## 1. Aggregator (`IAggregator`)
+## 2. Aggregator (`IAggregator`)
 
 中央托管合约，负责用户资金管理、协议适配器调用及仓位迁移。
 
-### 1.1 数据结构
+### 2.1 数据结构
 
 ```solidity
 struct Position {
-    address owner;
-    address asset;
-    uint256 amount;
-    address adapter;
+  bytes32 id;
+  address owner;
+  address collateralAsset;
+  address adapter;
+  uint256 collateralAmount;
+  address debtAsset;
+  uint256 debtAmount;
+  uint256 lastHealthFactor; // Ray precision (1e27), 0 when未借贷
 }
 ```
 
-- `owner`：仓位所属用户地址。
-- `asset`：基础资产（ERC20）地址。
-- `amount`：当前存入数量，单位为 token 原生精度。
+- `id`：仓位唯一标识，建议计算方式为 `keccak256(abi.encode(owner, collateralAsset, adapter, salt))`，便于多策略/多适配器共存。
+- `owner`：仓位所属用户地址，可为多签钱包或智能账户。
+- `collateralAsset`：抵押资产地址；与 `collateralAmount` 一起描述存入仓位的资产。
 - `adapter`：对应的协议适配器地址。
+- `collateralAmount`：当前抵押数量，单位为 token 原生精度。
+- `debtAsset`：借出资产地址，未借贷时为零地址。
+- `debtAmount`：未偿还借款的本金（或当前债务余额），单位为 token 原生精度。
+- `lastHealthFactor`：最近一次从协议读取的健康度（Ray 精度，1e27）；未借贷时可设为 0，借贷操作后应刷新。
 
-### 1.2 事件
+### 2.2 事件
 
 | 事件 | 参数 | 描述 |
 |------|------|------|
-| `Deposited(address indexed user, address indexed adapter, uint256 amount)` | `user` 调用者；`adapter` 目标协议；`amount` 数量 | 存款成功触发，后端可据此更新仓位表。 |
-| `Withdrawn(address indexed user, address indexed adapter, uint256 amount)` | 同上 | 赎回完成。 |
-| `Migrated(address indexed user, address fromAdapter, address toAdapter, uint256 amount)` | `fromAdapter` 原协议；`toAdapter` 新协议 | 仓位迁移完成。 |
+| `Deposited(bytes32 indexed positionId, address indexed user, address indexed adapter, uint256 amount, bytes extra)` | `positionId` 仓位标识；`extra` 为 Adapter 自定义参数 | 存款成功触发，后端可据此更新仓位表。 |
+| `Withdrawn(bytes32 indexed positionId, address indexed user, address indexed adapter, uint256 amount, bytes extra)` | 同上 | 赎回完成。 |
+| `Migrated(bytes32 indexed positionId, address indexed user, address fromAdapter, address toAdapter, bytes data)` | `data` 描述迁移细节 | 仓位迁移完成。 |
+| `Borrowed(bytes32 indexed positionId, address indexed user, address indexed adapter, address asset, uint256 amount, bytes data)` | `asset` 借出资产；`data` 记录模式等信息 | 借款成功后触发，便于记录 `debtAsset`/`debtAmount`。 |
+| `Repaid(bytes32 indexed positionId, address indexed user, address indexed adapter, address asset, uint256 amount, bytes data)` | 同上 | 借款偿还成功。 |
 
-### 1.3 函数
+### 2.3 函数
 
 | 函数 | 目标 | 关键参数 | 使用提示 |
 |------|------|----------|---------|
-| `deposit(address asset, uint256 amount, address adapter)` | 管理用户入金并调用 Adapter 完成存款 | `asset` ERC20 地址；`amount` > 0；`adapter` 已注册 | 调用前需完成授权；失败通常来自 allowance 不足或 Adapter revert |
-| `withdraw(address asset, uint256 amount, address adapter)` | 赎回资产并返还给用户 | `amount` <= 仓位余额；`adapter` 必须匹配仓位记录 | 常用于用户主动赎回或手动迁移；需处理 Adapter 失败场景 |
-| `migrate(address user, address fromAdapter, address toAdapter, uint256 amount, bytes data)` | 将仓位从协议 A 迁移到协议 B | `data` 建议 `abi.encode(asset, flashRoute, extra)` | 仅允许 `flashExecutor` 调用；`flashRoute` 为 `NONE` 时需走分步迁移 |
-| `getPosition(address user, address asset)` | 查询链上仓位快照 | `user`/`asset` | 后端和 Worker 可据此校验本地数据 |
+| `deposit(bytes32 positionId, address collateralAsset, uint256 amount, address adapter, bytes extra)` | 追加抵押资产或创建新仓位 | `positionId == 0` 表示自动衍生；`extra` 可携带 permit、slippage、Adapter 自定义参数 | 调用前需完成授权；成功后返回/更新 `positionId` 并刷新健康度 |
+| `withdraw(bytes32 positionId, uint256 amount, bytes extra)` | 赎回抵押资产并返还给用户 | `extra` 可用于设定最小可接受数量、赎回路径 | 借贷仓位需确保健康度充足；失败需回滚 |
+| `borrow(bytes32 positionId, address debtAsset, uint256 amount, bytes data)` | 在指定仓位基础上借出资产 | `data` 描述利率模式、杠杆计划或 Adapter 专属字段 | 仅允许仓位所有者/授权方调用；执行前应刷新健康度并在 Adapter 中借款 |
+| `repay(bytes32 positionId, address debtAsset, uint256 amount, bytes data)` | 偿还指定仓位的借款资产 | 支持部分或全部偿还；`data` 可包含折扣券、利率模式等 | 若为全部偿还，可在内部重置 `debtAsset`/`debtAmount`；注意手续费或利息差异 |
+| `migrate(MigrationParams calldata params)` | 将仓位从协议 A 迁移到协议 B | `params` 包含多资产迁移、债务分腿与闪电贷路线 | 仅允许 `flashExecutor` 或治理指定角色调用；需覆盖失败回滚逻辑 |
+| `getPosition(bytes32 positionId)` | 查询链上仓位快照 | 返回 `Position` 结构体 | 后端和 Worker 可据此校验本地数据与风险指标 |
+| `derivePositionId(address owner, address collateralAsset, address adapter, bytes32 salt)` | 纯函数生成仓位标识 | `salt` 可由链下脚本或策略模块生成 | 在多策略共享同一资产时保持 positionId 可预测，便于链上链下对账 |
+| `setAdapter(address adapter, bool allowed)` | 管理 Adapter 白名单 | `allowed` 为 `true` 时启用 Adapter | 仅治理角色可调用，执行后建议记录事件并在链下同步 |
+| `setFlashExecutor(address newExecutor)` | 更新闪电贷执行器地址 | `newExecutor` 为新的执行器合约地址 | 仅治理角色可调用，更新后需链下同步以免迁移失败 |
+| `pause()` / `unpause()`（可选） | 应急停机/恢复 | 无 | 若 Aggregator 实现 `Pausable`，应由多签触发以应对异常 |
 
-### 1.4 合约交互流程图
+> 若项目使用 `AccessControl`，则 `setAdapter`/`setFlashExecutor`/`pause` 等管理函数必须限制为 `ADMIN_ROLE` 或多签账户调用。文档中的 Quickstart 需配合治理流程执行。
+
+#### 2.3.1 扩展参数与结构体
+
+```solidity
+struct DepositExtra {
+  bytes permit;          // EIP-2612 或 Permit2 数据，可为空
+  uint256 minShares;     // 允许的最小份额，避免滑点
+  bytes adapterParams;   // 直接透传给 Adapter 的自定义字段
+}
+
+struct DebtLeg {
+  address asset;
+  uint256 amount;
+  bytes adapterData;     // 比如利率模式、杠杆倍数
+}
+
+struct CollateralLeg {
+  address asset;
+  uint256 amount;
+  bytes adapterData;     // 提供分腿赎回/存款的补充信息
+}
+
+struct FlashRoute {
+  bytes32 provider;      // 如 "AAVE", "BALANCER"
+  uint256 feeBps;
+  uint256 maxSlippageBps;
+  bytes payload;         // 供执行器解码的自定义数据
+}
+
+struct MigrationParams {
+  bytes32 positionId;
+  address user;
+  address fromAdapter;
+  address toAdapter;
+  CollateralLeg[] collateralOut;
+  CollateralLeg[] collateralIn;
+  DebtLeg[] repayLegs;
+  DebtLeg[] borrowLegs;
+  FlashRoute flash;
+  bytes extra;           // 额外策略信息（如风控标签、批量任务 ID）
+}
+```
+
+- `positionId` 作为所有操作统一入口，可通过 `Aggregator.derivePositionId(owner, collateralAsset, adapter, salt)`（建议新增的纯函数）或链下脚本生成，确保多策略扩展时避免冲突。
+- `extra` / `adapterParams` 均透传给 Adapter，便于支持 permit、meta-transaction、复杂赎回路径等自定义需求。编码约定为 `bytes extra = abi.encode(DepositExtra)`：
+  ```solidity
+  IAggregator.DepositExtra memory extraParams = IAggregator.DepositExtra({
+      permit: myPermitData,
+      minShares: minShares,
+      adapterParams: abi.encode(MyAdapterExtra({ slippageBps: 50 }))
+  });
+  bytes memory encodedExtra = abi.encode(extraParams);
+  aggregator.deposit(positionId, collateralAsset, amount, adapter, encodedExtra);
+  ```
+  在 Aggregator 内部需使用 `abi.decode(extra, (DepositExtra))` 解析。
+- 迁移流程允许多资产、多笔债务同时处理，避免未来扩展更多闪电贷来源或复合策略时需要修改 ABI。
+
+### 2.4 示例：构造 `MigrationParams`
+
+```solidity
+IAggregator.MigrationParams memory params = IAggregator.MigrationParams({
+  positionId: positionId,
+  user: user,
+  fromAdapter: compoundAdapter,
+  toAdapter: makerAdapter,
+  collateralOut: new IAggregator.CollateralLeg[](1),
+  collateralIn: new IAggregator.CollateralLeg[](1),
+  repayLegs: new IAggregator.DebtLeg[](1),
+  borrowLegs: new IAggregator.DebtLeg[](1),
+  flash: IAggregator.FlashRoute({
+    provider: bytes32("AAVE"),
+    feeBps: 9,
+    maxSlippageBps: 30,
+    payload: abi.encode(
+      AaveFlashParams({
+        asset: debtAsset,
+        amount: flashAmount,
+        mode: 0
+      }) // 用户自定义结构体，用于描述闪电贷参数
+    )
+  }),
+  extra: abi.encode(MigrationMetadata({
+    taskId: bytes32("migration-task-001"),
+    riskTag: 1
+  })) // 用户自定义结构体，存储链下任务上下文
+});
+
+params.collateralOut[0] = IAggregator.CollateralLeg({
+  asset: collateralAsset,
+  amount: redeemUnderlying,
+  adapterData: bytes("")
+});
+params.collateralIn[0] = IAggregator.CollateralLeg({
+  asset: collateralAsset,
+  amount: depositUnderlying,
+  adapterData: abi.encode(uint256(0))
+});
+params.repayLegs[0] = IAggregator.DebtLeg({
+  asset: debtAsset,
+  amount: repayAmount,
+  adapterData: abi.encode(uint8(2)) // 协议自定义：2 = 可变利率
+});
+params.borrowLegs[0] = IAggregator.DebtLeg({
+  asset: debtAsset,
+  amount: borrowAmount,
+  adapterData: abi.encode(uint8(1)) // 1 = 稳定利率
+});
+
+FlashLoanExecutor(executor).executeMigration(params);
+```
+
+- `flash.payload` 与链下任务共用同一结构，确保闪电贷参数可重复解码。
+- `extra` 适合放置批处理 ID、风控标签或回滚所需的上下文；若无需扩展，可传入空字节串。
+- `repayLegs`、`borrowLegs`、`collateralOut`、`collateralIn` 的顺序需与实际执行顺序保持一致，以便 Adapter 在内部逐步校验健康度。
+- 示例中的 `AaveFlashParams`、`MigrationMetadata` 仅用于展示编码方式，实际项目可替换为任意自定义结构。
+
+### 2.5 合约交互流程图
 
 ```mermaid
 flowchart TD
@@ -137,12 +324,12 @@ flowchart TD
   end
 
   %% Deposit
-  U -- deposit(asset, amount, adapter) --> A
+  U -- deposit(posId, asset, amount, adapter, extra) --> A
   A -- approve & transfer --> AD1
   AD1 -- mint / deposit --> C
 
   %% Withdraw
-  U -- withdraw(asset, amount, adapter) --> A
+  U -- withdraw(posId, amount, extra) --> A
   A -- redeem/exit 请求 --> AD1
   AD1 -- redeemUnderlying --> C
   AD1 -- transfer asset --> U
@@ -162,37 +349,66 @@ flowchart TD
   F -- repay loan --> FL
 
   %% Position Query
-  API[[Backend API]] -- getPosition(user, asset) --> A
+  API[[Backend API]] -- getPosition(positionId) --> A
 ```
+
+### 2.6 权限与多签清单
+
+- **部署后转权**：完成部署立即调用 `transferOwnership`（或 `renounceRole`）将控制权交给预设多签/Timelock，避免部署者遗忘转权。
+- **角色分层**：通过 `AccessControl` 定义 `ADMIN_ROLE`、`WORKER_ROLE`，仅允许多签修改 Adapter 白名单、更新 `flashExecutor`，Worker 仅能触发迁移。
+- **Adapter 上架前检查**：要求多签提案包含 `setAdapter`、底层协议授权（如 `enterMarkets`）、风险参数（LTV、滑点阈值）。提案描述需附 calldata 与影响评估。
+- **提案生成脚本**：使用脚本输出 ABI 编码，附带 JSON 摘要，以便团队交叉复核，必要时在仓库记录 Proposal ID。
+- **应急回滚**：准备紧急提案模板（禁用 Adapter、替换 `flashExecutor`、冻结迁移），并在 Runbook 中记录触发条件与执行步骤。
 
 ---
 
-## 2. Adapter (`IAdapter`)
+## 3. Adapter (`IAdapter`)
 
-协议适配层，封装各协议（Compound、Maker 等）的具体交互。
+协议适配层，封装各协议（Compound、Maker、Aave 等）的具体交互；每个 Adapter 既负责存取款也提供借贷能力。
 
-### 2.1 函数
+### 3.1 函数
 
 | 函数 | 目标 | 实现提示 |
 |------|------|---------|
-| `deposit(address asset, uint256 amount)` | 调用底层协议完成存款 | 仅 Aggregator 调用；需确保授权充足（Compound 走 `mint`，Maker 走 `join/lock`）；失败应直接 revert |
-| `withdraw(address asset, uint256 amount, address recipient)` | 赎回资产并转给指定地址 | 限制调用来源以防资产被盗；Compound 推荐 `redeemUnderlying`，Maker 需执行 `free + exit` |
+| `deposit(address asset, uint256 amount, address onBehalfOf, bytes data)` | 调用底层协议完成存款 | `data` 可携带特定协议所需参数（如进入市场、杠杆设定）；`onBehalfOf` 统一记录份额归属 | 仅 Aggregator 调用；需确保授权充足（Compound 走 `mint`，Maker 走 `join/lock`）；失败应直接 revert |
+| `withdraw(address asset, uint256 amount, address recipient, bytes data)` | 赎回资产并转给指定地址 | `data` 可描述赎回模式或最小接收量 | 限制调用来源以防资产被盗；Compound 推荐 `redeemUnderlying`，Maker 需执行 `free + exit` |
 | `getSupplyRate(address asset)` | 返回当前供应利率 | 建议统一单位（BPS 或 Ray），供 rateFetcher 周期刷新 |
 | `getProtocolName()` | 标识协议名称 | 用于 Redis key、后端动态映射，例如 `"COMPOUND"`、`"MAKER"` |
 
+所有 Adapter 在注册到 Aggregator 前必须通过 `IBorrowingAdapter` 校验，确保借贷流程在各协议间保持一致调用约定。
+
+### 3.2 借贷扩展接口（`IBorrowingAdapter`）
+
+```solidity
+interface IBorrowingAdapter /* is IAdapter */ {
+  function borrow(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external;
+  function repay(address asset, uint256 amount, address onBehalfOf, bytes calldata data) external;
+  function getDebt(address user, address asset) external view returns (uint256 outstanding, uint256 interestIndex);
+  function getHealthFactor(address user) external view returns (uint256 hfRay);
+}
+```
+
+- `borrow` / `repay`：由 Aggregator 调用，`onBehalfOf` 统一传入用户地址，`data` 可携带利率模式（稳定/浮动）、杠杆倍数等参数。
+- `getDebt`：返回用户在底层协议的债务余额，可选提供利率指数，便于后端折算实时债务。
+- `getHealthFactor`：补充协议原生的健康度指标（Ray 精度）。
+- Aggregator 在 Adapter 注册时写入白名单并校验借贷函数签名，部署后可直接调用，无需额外探测逻辑。
+
 ---
 
-## 3. 闪电贷执行器 (`FlashLoanExecutor`)
+## 4. 闪电贷执行器 (`FlashLoanExecutor`)
 
 负责串联闪电贷借款、Aggregator 迁移、闪电贷偿还。
 
-### 3.1 核心入口
+### 4.1 核心入口
 
 | 函数 | 目标 | 关键步骤 | 失败处理 |
 |------|------|----------|---------|
-| `executeMigration(address user, address asset, uint256 amount, bytes data)` | 在闪电贷回调中驱动整笔迁移 | ① 借入资产；② 解码 `flashRoute` 并调用 `Aggregator.migrate`；③ 将资金存入目标协议；④ 偿还本金和费用 | 任一步骤失败需 revert，由链下 Worker 选择其他路线 |
+| `executeMigration(IAggregator.MigrationParams calldata params)` | 在闪电贷回调中驱动整笔迁移 | ① 借入资产；② 解码 `params.flash` 并调用 `Aggregator.migrate`；③ 将资金存入目标协议；④ 偿还本金和费用 | 任一步骤失败需 revert，由链下 Worker 选择其他路线 |
 
-### 3.2 附加接口建议
+- 实现时需引入 `IAggregator` 接口：`import {IAggregator} from "../IAggregator.sol";`。
+- `params.flash.payload` 用于与特定闪电贷提供方交互（如 Aave `FLASHLOAN_SIMPLE` 的扩展参数），与链下任务数据保持一致。
+
+### 4.2 附加接口建议
 
 为方便多协议闪电贷接入，可定义统一提供者接口（示例）：
 
@@ -207,7 +423,7 @@ interface IFlashLoanProvider {
 }
 ```
 
-### 3.3 闪电贷路由与回退
+### 4.3 闪电贷路由与回退
 
 - **Routing 目标**：聚合 Balancer、Uniswap V3、Aave 等多家提供方，选择费用最低、流动性充足的闪电贷来源。
 - **链上处理**：
@@ -216,6 +432,7 @@ interface IFlashLoanProvider {
 - **链下协调**：
   - Worker/策略模块预先收集各提供方的费用、可用额度，写入 Redis 或数据库。
   - 生成迁移任务时选出最佳路线；若没有合适路线，将 `provider` 设为 `NONE`，提醒执行器走分步迁移。
+- **编码约定**：统一使用 `abi.encode`/`abi.decode` 处理 `flashRoute` 及扩展字段，确保链上合约、后端和脚本保持一致解析。
 - **回退逻辑**：当闪电贷调用失败或提供方流动性不足时，执行器需要：
   1. 回滚当前交易（revert），由 Worker 重试其它路线；或
   2. 采用多笔交易完成迁移（先赎回再存入）。
@@ -223,199 +440,48 @@ interface IFlashLoanProvider {
 
 ---
 
-## 4. 测试辅助合约
+## 5. 测试辅助合约
 
 在 Foundry 测试中使用的 mock，生产不部署。
 
-### 4.1 `MockERC20`
+### 5.1 `MockERC20`
 
 - `mint(address to, uint256 amount)`：测试环境铸币。
 - 继承自 `Solmate` 的 `ERC20`，兼容 Foundry。
 
-### 4.2 `MockOracle`
+### 5.2 `MockOracle`
 
 - `setRate(uint256 _rate)`：设置模拟利率。
 - `getRate(address)`：读取设定值。
 
 ---
 
-## 5. 交互建议
+## 6. 交互建议
 
 - **ABI 生成**：使用 `forge inspect <Contract> abi` 或 `abigen` 生成 Go 绑定。
 - **交易参数**：统一使用 18 位精度的资产时注意转换；Maker 可能存在不同 `dec`。
 - **安全校验**：
   - 确保后端仅对注册 Adapter 发起调用。
   - 在调用 `migrate` 前校验 Redis/DB 与链上仓位一致。
+  - 借贷场景下需同步底层协议的健康度、债务余额，触发阈值告警或限制赎回。
 - **事件监听**：
   - 定期抓取 `Deposited`/`Withdrawn`/`Migrated` 用于对账。
   - 可使用 `eth_getLogs` 或 `ethers.js`/`go-ethereum` 订阅。
 
 ---
-## 6. Compound 协议接口参考
+## 7. 协议适配延伸阅读
 
-> 以下基于 Compound V2 主网合约。若部署于 L2 或测试网，请替换对应地址。建议在 Adapter 中使用常量或配置文件维护。
+- `docs/adapters/compound.md`：Compound V2/V3 接入流程、主网地址、常见错误码与 Foundry fork 测试指南。
+- `docs/adapters/maker.md`：Maker DSProxy 操作路径、`Vat` 精度换算、稳定费处理与回滚策略。
+- `docs/adapters/aave.md`：Aave V3 流动性模式、`sMode` 借款参数、闪电贷差异与自检脚本。
+- 若新增协议，建议在 `docs/adapters/<protocol>.md` 中沿用同一模板：
+  1. 前置条件与部署配置；
+  2. 核心合约与地址；
+  3. Adapter 必须实现的自定义 `adapterData` 约定；
+  4. 测试 / 回滚流程；
+  5. 监控指标与报警阈值。
 
-### 6.1 关键合约与地址
-
-| 合约             | 功能             | 主网地址 (示例)                                    |
-| -------------- | -------------- | -------------------------------------------- |
-| `Comptroller`  | 市场风险控制、COMP 激励 | `0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B` |
-| `cDAI`         | DAI 供应市场       | `0x5d3a536E4D6DbD6114cc1Ead35777bAB948E3643` |
-| `cUSDC`        | USDC 供应市场      | `0x39AA39c021dfbaE8faC545936693aC917d5E7563` |
-| `cETH`         | ETH 供应市场 (原生)  | `0x4DdC2D193948926d02f9B1fE9e1daa0718270ED5` |
-| `CompoundLens` | 读接口聚合器         | `0xd513d22422a3062Bd342Ae374b4ba1b7518B7f6c` |
-
-### 6.2 cToken 接口详解
-
-#### `mint(uint256 mintAmount)`
-- **用途**：存入 `mintAmount` 单位的基础资产，按当前汇率获得 cToken。
-- **调用步骤**：
-  1. `ERC20(asset).approve(cToken, mintAmount)`。
-  2. `cToken.mint(mintAmount)` → 返回 `uint err`。
-- **错误处理**：`require(err == 0, "COMPOUND_MINT_FAILED")`。
-- **备注**：对于 `cETH`，函数签名为 `mint()`，需随交易携带 `msg.value`。
-
-#### `redeem(uint256 redeemTokens)` / `redeemUnderlying(uint256 redeemUnderlying)`
-- **用途**：赎回对应数量的 cToken 或基础资产。
-- **区别**：
-  - `redeem` 输入 cToken 数量。
-  - `redeemUnderlying` 输入基础资产数量，内部自动换算。
-- **建议**：Adapter 若以基础资产计量仓位，优先使用 `redeemUnderlying`，避免汇率偏差。
-
-#### `exchangeRateCurrent()` 与 `exchangeRateStored()`
-- **结果单位**：`1e18`。
-- **用途**：
-  - `exchangeRateCurrent` 会触发利息累计，适合链上实时更新。
-  - `exchangeRateStored` 不修改状态，适合估算或 off-chain 读取。
-- **换算**：基础资产余额 = `cTokenBalance * exchangeRate / 1e18`。
-
-#### `supplyRatePerBlock()`
-- **返回**：每个区块的供应利率，单位 `1e18`。
-- **年化**：`apr = rate * blocksPerYear`，`blocksPerYear ≈ 4_377_000`（以太坊主网）。
-
-#### `balanceOf(address account)` / `borrowBalanceStored(address account)`
-- **用途**：仓位监控，`balanceOf` 返回 cToken 余额。
-- **Adapter 中**：可用于 double-check Aggregator 中记录的份额是否一致。
-
-### 6.3 Comptroller 相关接口
-
-#### `enterMarkets(address[] calldata cTokens)`
-- **功能**：允许账户将特定市场的抵押用于借贷。
-- **在纯供应场景**：可选调用；若未来支持抵押借贷，应在 Adapter 初始化阶段执行一次。
-
-#### `claimComp(address holder)`
-- **用途**：领取 COMP 激励。
-- **策略**：可在收益策略中按周或按阈值触发，累积奖励后统一处置。
-
-#### `markets(address cToken)`
-- **返回**：`(bool isListed, uint collateralFactorMantissa, bool isComped)`。
-- **用途**：在构建策略或风控时，校验市场是否启用以及抵押因子。
-
-### 6.4 CompoundLens 读接口
-
-- `cTokenBalances(address cToken, address account)`：一次返回余额、兑换率、基础资产余额等。
-- `cTokenUnderlyingPrice(address cToken)`：返回基础资产价格（通过 Oracle）。
-- **RateFetcher 中**：
-  - 先调用 `supplyRatePerBlock` 取利率。
-  - 可结合 `cTokenUnderlyingPrice` 计算美元年化收益。
-
-### 6.5 Adapter 开发建议
-
-1. **状态存储**：记录 `cToken` 地址以及 `asset` 地址，便于在 `deposit/withdraw` 中引用。
-2. **错误码映射**：Compound 的 `Error` 枚举可在文档中查阅，对常见错误进行 `require` 处理。
-3. **Gas 优化**：
-  - 避免重复 `approve`，可在部署时设置无限授权。
-  - 对 `exchangeRateCurrent` 的调用应视情况避免频繁触发。
-4. **测试**：
-  - 使用 Foundry fork 主网，验证 `mint/redeem` 全流程。
-  - 模拟利率变化，可通过修改区块高度或 `anvil_setNextBlockBaseFeePerGas` 等手段。
-
----
-
-## 7. MakerDAO 协议接口参考
-
-> 以 `ETH-A` 仓位为例说明 Maker 核心调用流程。其他抵押品（`USDC-A`, `WBTC-A`, `stETH-A` 等）在地址和参数上有所不同。
-
-### 7.1 核心合约与地址
-
-| 合约 | 功能 | 主网地址 |
-|------|------|----------|
-| `Vat` | 全局账本，记录抵押与债务 | `0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B` |
-| `GemJoin` (`ETH-A`) | WETH 抵押入口 | `0x2F0b23f53734252Bda2277357e97e1517d6B042A` |
-| `DaiJoin` | DAI 核心账户入口 | `0x9759A6Ac90977b93B58547b4A71c78317f391A28` |
-| `Jug` | 稳定费累积 | `0x19c0976f590D67707E62397C87829d896Dc0f1F1` |
-| `Spot` | 价格模块，维护抵押系数 | `0x65C79FCB50Ca1594b025960e539eD7A9a2eC2b7f` |
-| `DSProxyFactory` | 创建 DSProxy | `0xA26e15C895EFc0616177B7c1e7270A4C7D51C997` |
-
-### 7.2 Maker 核心数据结构
-
-- `ilk`：抵押品类型，`bytes32`。示例：`bytes32("ETH-A")`。
-- `urn`：仓位标识，通常为 `DSProxy` 地址。
-- `ink`：抵押数量（RAY，`1e27`）。
-- `art`：债务数量（WAD，`1e18`）。
-- `rate`：`Vat.ilks(ilk)` 返回的累积费率（RAY）。
-
-### 7.3 存款流程（增加抵押）
-
-1. **将 WETH 授权给 `GemJoin`**：
-  ```solidity
-  IERC20(weth).approve(gemJoin, amount);
-  ```
-2. **调用 `GemJoin.join(urn, amount)`**：
-  - 将外部 WETH 转入 Maker 系统。
-  - `urn` 为目标仓位地址（可为 Adapter 本身或 DSProxy）。
-3. **调用 `Vat.frob(ilk, urn, urn, urn, int(dink), 0)`**：
-  - `dink = int(amountScaled)`（转换为 18 位或 RAY 单位）。
-  - `dart = 0`（不借出 DAI）。
-4. **（可选）调用 `Jug.drip(ilk)`**：
-  - 确保稳定费数据更新，尤其在计算利率时。
-
-### 7.4 赎回流程（减少抵押）
-
-1. **调用 `Vat.frob(ilk, urn, urn, urn, -int(dink), -int(dart))`**：
-  - 若无负债，则 `dart = 0`。
-  - 保证仓位安全：`ink` 不得减至负值。
-2. **调用 `GemJoin.exit(recipient, amount)`**：
-  - 将抵押资产从 Maker 取出。
-3. **若存在 DAI 债务**：
-  - 需要先使用 `DaiJoin.join(urn, wad)` 将 DAI 转回 Maker，再 `frob` 归还债务。
-
-### 7.5 利率与价格接口
-
-- `Jug.drip(bytes32 ilk)`：累积稳定费，更新 `Vat.ilks` 中的 `rate`。
-- `Vat.ilks(bytes32 ilk)`：返回 `(Art, rate, spot, line, dust)`。
-- **稳定费计算**：
-  - `rate` 是累积值，初始 `1e27`。
-  - 年化稳定费 ≈ `(rate - RAY) * secondsPerYear / secondsSinceLastDrip`。
-- **价格**：
-  - `Spotter.ilks(ilk)` 返回 `pip`（oracle）和 `mat`（抵押比率）。
-  - 结合 `Vat.ilks(ilk).spot` 得到最大可借额度。
-
-### 7.6 Adapter 开发要点
-
-1. **权限管理**：
-  - 若 Adapter 直接与 Vat 交互，需要调用 `Vat.hope(address)` 授权自身或 Aggregator。
-  - 推荐为每个资产部署一个 `DSProxy`，由 Aggregator 控制，以便调用复杂操作 (`frob`, `flux`, `move`)。
-2. **单位转换**：
-  - Maker 使用多种精度：`WAD` (`1e18`), `RAY` (`1e27`), `RAD` (`1e45`)。
-  - 例如 `dink` 需要转换为 18 位精度，再根据 `GemJoin.dec()` 调整。
-3. **错误捕获**：
-  - Maker revert 信息多为字符串（如 `Vat/not-allowed`），Adapter 应统一转换为易读错误。
-4. **测试策略**：
-  - Foundry fork 环境中，需提前为 `DSProxy` 提供足额 WETH、DAI。
-  - 可利用 Maker 测试合约（`dss-test`）快速搭建本地环境。
-
-### 7.7 Go 端集成提示
-
-- **ABI**：
-  - 从 Maker 官方仓库或使用 `forge inspect` 生成 `Vat`, `GemJoin`, `DaiJoin`, `Jug` ABI。
-- **调用顺序**：
-  - 使用 `bind.TransactOpts` 调用写函数，确保 Gas 限制足够高。
-  - 对于 `frob` 等多参数函数，建议在 Go 侧封装 helper，提高可读性。
-- **监控**：
-  - 订阅 `LogNote` 事件（Maker 标准日志），可追踪 `frob`, `fork`, `grab` 等关键操作。
-
----
+将协议细节与本参考文档解耦，可以保持本文聚焦接口约束，而协议特定的注意事项则集中在 `docs/adapters/` 目录，方便团队按需查阅。
 
 ## 8. 后续扩展建议
 
