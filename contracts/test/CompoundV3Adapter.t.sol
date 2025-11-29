@@ -279,4 +279,97 @@ contract CompoundV3AdapterTest is Test {
         // 允许极小的误差（因为可能有 100 秒的利息未还，或者精度截断）
         assertApproxEqAbs(cometDebt, 0, 1000); 
     }
+
+    function testHealthFactor() public {
+        AssetInfo memory info = ICometHelper(COMET_USDC).getAssetInfo(0);
+
+        uint64 liquidateFactor = info.liquidateCollateralFactor;
+        console.log("Liquidate Collateral Factor:", liquidateFactor);
+
+        uint256 supplyAmount = 1 * (10 ** collateralDecimals); // 1 WBTC
+
+        // 抵押品价值 = 1 WBTC * $100,000 = $100,000
+        // 临界债务 = $100,000 * liquidateFactor
+        // 假设 Factor 是 0.8，那么临界债务是 $80,000
+        // 我们借一半，健康度应该是 2.0 左右
+        uint256 borrowAmount = (uint256(100000) * uint256(liquidateFactor)) / 1e18 / 2 * 1e6;   // 借一半临界债务
+
+        vm.startPrank(user);
+
+        // 存款
+        IERC20(collateralAsset).approve(address(aggregator), supplyAmount);
+        bytes32 posId = aggregator.deposit(
+            bytes32(0),
+            collateralAsset,
+            supplyAmount,
+            address(adapter),
+            ""
+        );
+
+        // 允许 Adapter 管理资金
+        IComet(COMET_USDC).allow(address(adapter), true);
+
+        // 借款 USDC
+        aggregator.borrow(
+            posId,
+            USDC,
+            borrowAmount,
+            ""
+        );
+
+        vm.stopPrank();
+
+        // 查询健康度
+        uint256 actualHF = adapter.getHealthFactor(user);
+        console.log("Actual Health Factor:", actualHF);
+        // 验证
+        // 理论上应该是 2.0 (2e18)
+        // 允许 1% 的误差，因为链上计算可能有微小的精度截断或利息干扰
+        assertApproxEqRel(actualHF, 2e18, 0.01e18);
+    }
+
+    function testBorrowExceedsLimit() public {
+        // 获取借贷抵押率 (Borrow Factor)
+        AssetInfo memory info = ICometHelper(COMET_USDC).getAssetInfo(0);
+        uint64 borrowFactor = info.borrowCollateralFactor;
+        console.log("Borrow Collateral Factor:", borrowFactor);
+
+        uint256 supplyAmount = 1 * (10 ** collateralDecimals); // 1 WBTC
+
+        // 计算最大可借额度
+        // MaxBorrow = Value * BorrowFactor
+        // 假设 Factor 是 0.65 (65%)
+        // MaxBorrow = $100,000 * 0.65 = $65,000
+        uint256 maxBorrow = (uint256(100000) * uint256(borrowFactor)) / 1e18 * 1e6; // USDC 有 6 位小数
+        console.log("Max Borrow Amount:", maxBorrow);
+
+        // 尝试借超出额度
+        uint256 tooMuchAmount = maxBorrow + 1000 * 1e6; // 多借 1000 USDC
+
+        vm.startPrank(user);
+
+        // 抵押 WBTC
+        IERC20(collateralAsset).approve(address(aggregator), supplyAmount);
+        bytes32 posId = aggregator.deposit(
+            bytes32(0),
+            collateralAsset,
+            supplyAmount,
+            address(adapter),
+            ""
+        );
+        // 允许 Adapter 管理资金
+        IComet(COMET_USDC).allow(address(adapter), true);
+
+        // 借款 USDC 应该失败
+        vm.expectRevert();
+
+        aggregator.borrow(
+            posId,
+            USDC,
+            tooMuchAmount,
+            ""
+        );
+
+        vm.stopPrank();
+    }
 }

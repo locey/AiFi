@@ -7,6 +7,18 @@ import {IAdapter, IBorrowingAdapter} from "../IAdapter.sol";
 
 import "../utils/Errors.sol";
 
+
+struct AssetInfo {
+    uint8 offset;
+    address asset;
+    address priceFeed;
+    uint64 scale;
+    uint64 borrowCollateralFactor;
+    uint64 liquidateCollateralFactor;
+    uint64 liquidationFactor;
+    uint128 supplyCap;
+}
+
 interface IComet {
     function supply(address asset, uint256 amount) external;
 
@@ -14,30 +26,26 @@ interface IComet {
 
     function supplyTo(address dst, address asset, uint256 amount) external;
 
-    function withdrawFrom(
-        address src,
-        address to,
-        address asset,
-        uint256 amount
-    ) external;
+    function withdrawFrom(address src, address to, address asset, uint256 amount) external;
 
     function borrow(address asset, uint256 amount) external; // V3 中借款通常也是通过 withdraw 操作基础资产实现，但这里为了清晰先列出
 
     function allow(address manager, bool isAllowed) external;
 
-    function isAllowed(
-        address owner,
-        address manager
-    ) external view returns (bool);
+    function isAllowed(address owner, address manager) external view returns (bool);
 
-    function userCollateral(
-        address account,
-        address asset
-    ) external view returns (uint128 balance, uint128 _reserved);
+    function userCollateral(address account, address asset) external view returns (uint128 balance, uint128 _reserved);
 
     function borrowBalanceOf(address account) external view returns (uint256);
 
     function baseToken() external view returns (address);
+
+    function baseScale() external view returns (uint256);
+    function baseTokenPriceFeed() external view returns (address);
+    function numAssets() external view returns (uint8);
+    function getAssetInfo(uint8 i) external view returns (AssetInfo memory);
+    function getPrice(address priceFeed) external view returns (uint256);
+    
     function isLiquidatable(address account) external view returns (bool);
     function getSupplyRate(uint256 utilization) external view returns (uint64);
     function getBorrowRate(uint256 utilization) external view returns (uint64);
@@ -124,18 +132,43 @@ contract CompoundV3Adapter is IAdapter, IBorrowingAdapter {
 
     // --- 查询视图 ---
     function getHealthFactor(address account) external view override returns (uint256) {
-        // TODO: 开发测试流程Mock, 简单逻辑，这里必须重写，需要引入 Compound 的价格预言机来计算真实的抵押率
-
-        // 检查用户是否可被清算
-        bool liquidatable = IComet(comet).isLiquidatable(account);
+        // 获取债务余额
+        uint256 debtBalance = IComet(comet).borrowBalanceOf(account);
         
-        if (liquidatable) {
-            return 0; // 如果已经可以被清算，健康度为 0
+        // 如果没有债务，健康值无穷大
+        if (debtBalance == 0) {
+            return type(uint256).max;
         }
-        
-        // 如果还没被清算，暂时返回一个安全值 (2.0)
-        // 真实项目中这里需要复杂的数学计算
-        return 2e18; 
+
+        IComet cometContract = IComet(comet);
+        uint8 numAssets = cometContract.numAssets();
+        uint256 totalCollateralValue = 0;
+
+        // 遍历所有资产计算加权抵押价值
+        for (uint8 i=0; i< numAssets; i++) {
+            AssetInfo memory info = cometContract.getAssetInfo(i);
+            (uint128 balance, ) = cometContract.userCollateral(account, info.asset);
+
+            if (balance > 0) {
+                uint256 price = cometContract.getPrice(info.priceFeed);
+                // 计算公式: (余额 * 价格 * 清算因子) / 资产精度
+                uint256 value = (uint256(balance) * price * info.liquidateCollateralFactor) / info.scale;
+                totalCollateralValue += value;
+            }
+        }
+
+        // 计算债务价值
+        address basePriceFeed = cometContract.baseTokenPriceFeed();
+        uint256 basePrice = cometContract.getPrice(basePriceFeed);
+        uint256 baseScale = cometContract.baseScale();
+
+        // 债务价值 = (债务余额 * 价格) / 资产精度
+        uint256 debtValue = (debtBalance * basePrice) / baseScale;
+        if (debtValue == 0) {
+            return type(uint256).max;
+        }
+
+        return totalCollateralValue / debtValue;
     }
 
     function getDebt(address account, address asset) external view override returns (uint256) {
