@@ -96,6 +96,13 @@ contract Aggregator is IAggregator, AccessControl {
             position.lastHealthFactor = 0;
         }
         position.collateralAmount += amount;
+        emit Deposited(
+            positionId,
+            msg.sender,
+            adapter,
+            amount,
+            extra
+        );
         return positionId;
     }
 
@@ -133,6 +140,13 @@ contract Aggregator is IAggregator, AccessControl {
             if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
             position.lastHealthFactor = healthFactor;
         }
+        emit Withdrawn(
+            positionId,
+            msg.sender,
+            position.adapter,
+            amount,
+            extra
+        );
     }
 
     function borrow(
@@ -174,6 +188,14 @@ contract Aggregator is IAggregator, AccessControl {
             .getHealthFactor(msg.sender);
         if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
         position.lastHealthFactor = healthFactor;
+        emit Borrowed(
+            positionId,
+            msg.sender,
+            position.adapter,
+            debtAsset,
+            amount,
+            data
+        );
     }
 
     function repay(
@@ -236,6 +258,14 @@ contract Aggregator is IAggregator, AccessControl {
                 .getHealthFactor(msg.sender);
             position.lastHealthFactor = healthFactor;
         }
+        emit Repaid(
+            positionId,
+            msg.sender,
+            position.adapter,
+            debtAsset,
+            amount,
+            data
+        );
     }
 
     function migrate(MigrationParams calldata params) external override {
