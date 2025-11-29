@@ -5,7 +5,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
-
 import {IAggregator} from "./IAggregator.sol";
 import {IAdapter, IBorrowingAdapter} from "./IAdapter.sol";
 import "./utils/Errors.sol";
@@ -15,10 +14,10 @@ contract Aggregator is IAggregator, AccessControl {
     mapping(address => bool) public isAdapterAllowed;
     bytes32[] public allPositionIds;
     address public flashExecutor;
-    bytes32 public constant ADAPTER_ADMIN_ROLE = keccak256("ADAPTER_ADMIN_ROLE");
+    bytes32 public constant ADAPTER_ADMIN_ROLE =
+        keccak256("ADAPTER_ADMIN_ROLE");
 
-    uint256 public constant MIN_HEALTH_FACTOR = 1e18; 
-
+    uint256 public constant MIN_HEALTH_FACTOR = 1e18;
 
     event AdapterPermissionUpdated(address indexed adapter, bool allowed);
 
@@ -28,41 +27,59 @@ contract Aggregator is IAggregator, AccessControl {
         _grantRole(ADAPTER_ADMIN_ROLE, msg.sender);
     }
 
-    function setAdapter(address adapter, bool allowed) external onlyRole(ADAPTER_ADMIN_ROLE) {
+    function setAdapter(
+        address adapter,
+        bool allowed
+    ) external onlyRole(ADAPTER_ADMIN_ROLE) {
         isAdapterAllowed[adapter] = allowed;
         emit AdapterPermissionUpdated(adapter, allowed);
     }
 
-    function deposit(bytes32 positionId, address collateralAsset, uint256 amount, address adapter, bytes calldata extra) external payable returns(bytes32) {
+    function deposit(
+        bytes32 positionId,
+        address collateralAsset,
+        uint256 amount,
+        address adapter,
+        bytes calldata extra
+    ) external returns (bytes32) {
         if (!isAdapterAllowed[adapter]) revert AdapterNotAllowed();
         if (amount == 0) revert InvalidAmount();
 
-        bool isEth = collateralAsset == address(0);
-
-        Position storage position = positions[positionId];
+        if (collateralAsset == address(0)) revert ETHNotAccepted();
 
         if (positionId == bytes32(0)) {
             // 新建仓位
-            positionId = derivePositionId(msg.sender, collateralAsset, adapter, keccak256(extra));
-            if (positions[positionId].owner != address(0)) revert PositionAlreadyExists();
+            positionId = derivePositionId(
+                msg.sender,
+                collateralAsset,
+                adapter,
+                keccak256(extra)
+            );
+            if (positions[positionId].owner != address(0))
+                revert PositionAlreadyExists();
             // 记录所有仓位 ID
             allPositionIds.push(positionId);
         } else {
             // 已有仓位，校验一致性
-            if (position.owner == address(0)) revert InvalidPosition();
-            if (position.owner != msg.sender) revert NotPositionOwner();
-            if (position.adapter != adapter) revert AdapterMismatch();
-            if (position.collateralAsset != collateralAsset) revert AssetMismatch();
+            Position storage existingPos = positions[positionId];
+            if (existingPos.owner == address(0)) revert InvalidPosition();
+            if (existingPos.owner != msg.sender) revert NotPositionOwner();
+            if (existingPos.adapter != adapter) revert AdapterMismatch();
+            if (existingPos.collateralAsset != collateralAsset)
+                revert AssetMismatch();
         }
 
-        if (isEth) {
-            if (msg.value != amount) revert InvalidETHAmount();
-        } else {
-            if (msg.value != 0) revert ETHNotAccepted();
-            SafeERC20.safeTransferFrom(IERC20(collateralAsset), msg.sender, address(this), amount);
-            SafeERC20.forceApprove(IERC20(collateralAsset), adapter, amount);
-        }
-        IAdapter(adapter).deposit{value: isEth ? amount : 0}(
+        Position storage position = positions[positionId];
+
+        // 统一 ERC20 处理逻辑
+        SafeERC20.safeTransferFrom(
+            IERC20(collateralAsset),
+            msg.sender,
+            address(this),
+            amount
+        );
+        SafeERC20.forceApprove(IERC20(collateralAsset), adapter, amount);
+        IAdapter(adapter).deposit(
             collateralAsset,
             amount,
             msg.sender,
@@ -105,27 +122,34 @@ contract Aggregator is IAggregator, AccessControl {
             position.collateralAsset,
             amount,
             msg.sender,
+            position.owner,
             extra
         );
 
         // 健康检查，如果有债务，需要确保健康因子满足要求
         if (position.debtAmount > 0) {
-            uint256 healthFactor = IBorrowingAdapter(position.adapter).getHealthFactor(msg.sender);
+            uint256 healthFactor = IBorrowingAdapter(position.adapter)
+                .getHealthFactor(msg.sender);
             if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
             position.lastHealthFactor = healthFactor;
         }
     }
 
-    function borrow(bytes32 positionId, address debtAsset, uint256 amount, bytes calldata data) external override {
+    function borrow(
+        bytes32 positionId,
+        address debtAsset,
+        uint256 amount,
+        bytes calldata data
+    ) external override {
         Position storage position = positions[positionId];
 
         // 权限与参数检查
         if (position.owner != msg.sender) revert NotPositionOwner();
         if (amount == 0) revert InvalidAmount();
-        
+
         // 债务资产一致性检查
         // debtAmount 为 0 时，首次借贷，设置债务资产
-        if (position.debtAmount == 0){
+        if (position.debtAmount == 0) {
             position.debtAsset = debtAsset;
         } else {
             // 非首次借贷，检查债务资产一致性
@@ -133,19 +157,31 @@ contract Aggregator is IAggregator, AccessControl {
         }
 
         // 执行借贷
-        IBorrowingAdapter(position.adapter).borrow(debtAsset, amount, msg.sender, data);
+        IBorrowingAdapter(position.adapter).borrow(
+            debtAsset,
+            amount,
+            msg.sender, // recipient: 钱给用户
+            position.owner, // owner: 债记在用户头上
+            data
+        );
 
         // 更新状态
         position.debtAmount += amount;
 
         // 健康检查
         // 借款会导致健康因子下降，必须确保借款后仍然高于最低阈值
-        uint256 healthFactor = IBorrowingAdapter(position.adapter).getHealthFactor(msg.sender);
+        uint256 healthFactor = IBorrowingAdapter(position.adapter)
+            .getHealthFactor(msg.sender);
         if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
         position.lastHealthFactor = healthFactor;
     }
 
-    function repay(bytes32 positionId, address debtAsset, uint256 amount, bytes calldata data) external override {
+    function repay(
+        bytes32 positionId,
+        address debtAsset,
+        uint256 amount,
+        bytes calldata data
+    ) external override {
         Position storage position = positions[positionId];
 
         // 权限与参数检查
@@ -155,17 +191,32 @@ contract Aggregator is IAggregator, AccessControl {
         if (position.debtAsset != debtAsset) revert AssetMismatch();
 
         // 自己转移：用户 -> 聚合器
-        SafeERC20.safeTransferFrom(IERC20(debtAsset), msg.sender, address(this), amount);
+        SafeERC20.safeTransferFrom(
+            IERC20(debtAsset),
+            msg.sender,
+            address(this),
+            amount
+        );
         // 授权聚合器：聚合器 -> 适配器
         SafeERC20.forceApprove(IERC20(debtAsset), position.adapter, amount);
+    
         // 执行偿还
-        IBorrowingAdapter(position.adapter).repay(debtAsset, amount, msg.sender, data);
+        IBorrowingAdapter(position.adapter).repay(
+            debtAsset,
+            amount,
+            msg.sender,
+            data
+        );
 
         // 检查合约里是否有多余的钱（底层协议没收走的钱）
         uint256 remainingBalance = IERC20(debtAsset).balanceOf(address(this));
         if (remainingBalance > 0) {
             // 退还多余的钱给用户
-            SafeERC20.safeTransfer(IERC20(debtAsset), msg.sender, remainingBalance);
+            SafeERC20.safeTransfer(
+                IERC20(debtAsset),
+                msg.sender,
+                remainingBalance
+            );
             // 修正：实际还款金额 = 传入金额 - 退回金额
             amount -= remainingBalance;
         }
@@ -181,10 +232,10 @@ contract Aggregator is IAggregator, AccessControl {
             position.lastHealthFactor = type(uint256).max;
         } else {
             // 如果还有剩余债务，更新最新的健康因子
-            uint256 healthFactor = IBorrowingAdapter(position.adapter).getHealthFactor(msg.sender);
+            uint256 healthFactor = IBorrowingAdapter(position.adapter)
+                .getHealthFactor(msg.sender);
             position.lastHealthFactor = healthFactor;
         }
-        
     }
 
     function migrate(MigrationParams calldata params) external override {
@@ -196,8 +247,17 @@ contract Aggregator is IAggregator, AccessControl {
 
         // 偿还旧债务
         if (params.repayAmount > 0) {
-            SafeERC20.forceApprove(IERC20(position.debtAsset), position.adapter, params.repayAmount);
-            IBorrowingAdapter(position.adapter).repay(position.debtAsset, params.repayAmount, position.owner, params.extra);
+            SafeERC20.forceApprove(
+                IERC20(position.debtAsset),
+                position.adapter,
+                params.repayAmount
+            );
+            IBorrowingAdapter(position.adapter).repay(
+                position.debtAsset,
+                params.repayAmount,
+                position.owner,
+                params.extra
+            );
 
             if (params.repayAmount > position.debtAmount) {
                 position.debtAmount = 0;
@@ -208,7 +268,13 @@ contract Aggregator is IAggregator, AccessControl {
 
         // 提取旧抵押品
         if (params.collateralAmount > 0) {
-            IAdapter(position.adapter).withdraw(position.collateralAsset, params.collateralAmount, address(this), params.extra);
+            IAdapter(position.adapter).withdraw(
+                position.collateralAsset,
+                params.collateralAmount,
+                address(this),
+                position.owner,
+                params.extra
+            );
             position.collateralAmount -= params.collateralAmount;
         }
 
@@ -217,31 +283,59 @@ contract Aggregator is IAggregator, AccessControl {
 
         // 存入新adapter
         if (params.collateralAmount > 0) {
-            SafeERC20.forceApprove(IERC20(position.collateralAsset), params.toAdapter, params.collateralAmount);
-            IAdapter(params.toAdapter).deposit(position.collateralAsset, params.collateralAmount, position.owner, params.extra);
+            SafeERC20.forceApprove(
+                IERC20(position.collateralAsset),
+                params.toAdapter,
+                params.collateralAmount
+            );
+            IAdapter(params.toAdapter).deposit(
+                position.collateralAsset,
+                params.collateralAmount,
+                position.owner,
+                params.extra
+            );
             position.collateralAmount += params.collateralAmount;
         }
-        
+
         // 借入新债务
         if (params.borrowAmount > 0) {
-            IBorrowingAdapter(params.toAdapter).borrow(position.debtAsset, params.borrowAmount, position.owner, params.extra);
-            
-            position.debtAsset = position.debtAsset;
+            IBorrowingAdapter(params.toAdapter).borrow(
+                params.newDebtAsset,
+                params.borrowAmount,
+                address(this),   // recipient: 钱给合约
+                position.owner, // owner: 债记在用户头上
+                params.extra
+            );
+
+            position.debtAsset = params.newDebtAsset;
             position.debtAmount = params.borrowAmount;
 
             // 将钱还给 flashExecutor
-            SafeERC20.safeTransfer(IERC20(params.newDebtAsset), flashExecutor, params.borrowAmount);
+            SafeERC20.safeTransfer(
+                IERC20(params.newDebtAsset),
+                flashExecutor,
+                params.borrowAmount
+            );
         }
 
         // 健康检查
-        uint256 healthFactor = IBorrowingAdapter(position.adapter).getHealthFactor(position.owner);
+        uint256 healthFactor = IBorrowingAdapter(position.adapter)
+            .getHealthFactor(position.owner);
         if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
         position.lastHealthFactor = healthFactor;
 
-        emit Migrated(params.positionId, position.owner, params.fromAdapter, params.toAdapter, params.extra);
+        emit Migrated(
+            params.positionId,
+            position.owner,
+            params.fromAdapter,
+            params.toAdapter,
+            params.extra
+        );
     }
 
-    function getPosition(bytes32 positionId) external view override returns (Position memory) {
+    function getPosition(
+        bytes32 positionId
+    ) external view override returns (Position memory) {
         return positions[positionId];
     }
 
@@ -259,7 +353,10 @@ contract Aggregator is IAggregator, AccessControl {
     }
 
     // 分页获取仓位（推荐，防止数据量过大）
-    function getPositions(uint256 start, uint256 limit) external view returns (Position[] memory) {
+    function getPositions(
+        uint256 start,
+        uint256 limit
+    ) external view returns (Position[] memory) {
         uint256 total = allPositionIds.length;
         if (start >= total) {
             return new Position[](0);
@@ -269,7 +366,7 @@ contract Aggregator is IAggregator, AccessControl {
         if (end > total) {
             end = total;
         }
-        
+
         uint256 resultLen = end - start;
         Position[] memory result = new Position[](resultLen);
 
@@ -289,4 +386,6 @@ contract Aggregator is IAggregator, AccessControl {
     ) public pure override returns (bytes32) {
         return keccak256(abi.encode(owner, collateralAsset, adapter, salt));
     }
+
+    receive() external payable {}
 }

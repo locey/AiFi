@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 .obsidian
 .vscode
+/contracts/contracts/
+/contracts/lib/
+/contracts/out/
